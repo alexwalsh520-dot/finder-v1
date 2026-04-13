@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Finder V1 daily at 02:00 Bali time
+
+[Timer]
+OnCalendar=*-*-* 02:00:00
+Persistent=true
+Unit=finder-v1-daily-run.service
+
+[Install]
+WantedBy=timers.target
+

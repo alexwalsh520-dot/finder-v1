@@ -1,0 +1,12 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.env
+.env.local
+.env.production
+
+finder_v1/output/
+finder_v1/state/
+finder_v1/transcripts/

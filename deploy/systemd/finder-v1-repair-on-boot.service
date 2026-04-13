@@ -1,0 +1,15 @@
+[Unit]
+Description=Repair Finder V1 stale local state on boot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=finder
+WorkingDirectory=/opt/finder-v1
+Environment=PYTHONPYCACHEPREFIX=/opt/finder-v1/.pycache
+EnvironmentFile=/etc/finder-v1.env
+ExecStart=/opt/finder-v1/.venv/bin/python -m finder_v1.main repair-state
+
+[Install]
+WantedBy=multi-user.target
