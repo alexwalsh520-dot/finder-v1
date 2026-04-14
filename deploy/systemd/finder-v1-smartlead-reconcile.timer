@@ -1,8 +1,8 @@
 [Unit]
-Description=Run Finder V1 Smartlead reconcile every 10 minutes
+Description=Run Finder V1 Smartlead reconcile every 2 minutes
 
 [Timer]
-OnCalendar=*:0/10
+OnCalendar=*:0/2
 Persistent=true
 Unit=finder-v1-smartlead-reconcile.service
 

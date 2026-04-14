@@ -115,6 +115,18 @@ class SupabaseClient:
         _, rows = self._request("GET", f"/leads?{'&'.join(filters)}")
         return rows if isinstance(rows, list) else []
 
+    def fetch_smartlead_sync_candidates(self, *, limit: int, offset: int = 0) -> List[Dict]:
+        filters = [
+            "select=id,instagram_handle,email,review_status,sent_to_smartlead,smartlead_campaign_id,smartlead_sent_at,export_batch_id",
+            "sent_to_smartlead=is.false",
+            "or=(email.not.is.null,instagram_handle.not.is.null)",
+            "order=batch_date.asc.nullslast,created_at.asc",
+            f"limit={limit}",
+            f"offset={offset}",
+        ]
+        _, rows = self._request("GET", f"/leads?{'&'.join(filters)}")
+        return rows if isinstance(rows, list) else []
+
     def update_lead_by_id(self, lead_id: str, payload: Dict) -> None:
         self._request(
             "PATCH",

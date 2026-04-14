@@ -17,7 +17,7 @@ from .email_search import best_candidate, classify_email, deep_email_search, dis
 from .qualification import QUALIFICATION_VERSION, ai_qualification, deterministic_qualification
 from .reel_transcriber import download_media, profile_reel_posts, transcript_output_paths, write_json, write_simple_pdf
 from .runtime_lock import PipelineBusyError, pipeline_lock, read_lock_metadata
-from .smartlead import extract_campaign_id, is_rate_limited_error, lookup_smartlead_email
+from .smartlead import build_account_lead_index, extract_campaign_id, normalize_instagram_handle
 from .supabase_client import SupabaseClient
 from .time_utils import business_now, next_business_time_iso, next_interval_iso, today_business_date, utc_now_iso
 from .youtube_search import search_channel
@@ -25,9 +25,7 @@ from .youtube_search import search_channel
 DEFAULT_DAILY_TARGET = 100
 DEFAULT_DAILY_BATCH_SIZE = 12
 DEFAULT_DOC_CHECK_LIMIT = 100
-DEFAULT_SMARTLEAD_RECONCILE_LIMIT = 200
-DEFAULT_SMARTLEAD_HISTORICAL_CLEANUP_LIMIT = 50
-SMARTLEAD_HISTORICAL_SLEEP_SECONDS = 1.5
+DEFAULT_SMARTLEAD_RECONCILE_LIMIT = 5000
 ZERO_PROGRESS_ROTATION_THRESHOLD = 2
 STALL_PROGRESS_MINUTES = 90
 DEFAULT_FALLBACK_SEEDS = [
@@ -46,7 +44,7 @@ CRON_JOB_DOC_ID = "finder-v1-doc-harvest"
 CRON_JOB_SMARTLEAD_ID = "finder-v1-smartlead-reconcile"
 DAILY_RUN_SCHEDULE = "Daily 02:00 Bali time"
 DOC_HARVEST_SCHEDULE = "Every 30 minutes"
-SMARTLEAD_RECONCILE_SCHEDULE = "Every 10 minutes"
+SMARTLEAD_RECONCILE_SCHEDULE = "Every 2 minutes"
 
 
 def parse_args() -> argparse.Namespace:
@@ -573,70 +571,81 @@ def reconcile_smartlead(
     if not smartlead_api_key:
         raise RuntimeError("SMARTLEAD_API_KEY is not configured.")
 
-    rows = supabase.fetch_reviewable_leads(limit=limit, historical=historical)
+    smartlead_index = build_account_lead_index(smartlead_api_key)
     summary = Counter()
-    summary["candidates"] = len(rows)
+    summary["smartlead_campaigns"] = int(smartlead_index.get("campaign_count") or 0)
+    summary["smartlead_leads_indexed"] = int(smartlead_index.get("lead_count") or 0)
+
     matched_rows: List[Dict[str, Any]] = []
     unmatched_rows: List[Dict[str, Any]] = []
-    rate_limited = False
-    for row in rows:
-        email = (row.get("email") or "").strip().lower()
-        if not email:
-            summary["skipped_missing_email"] += 1
-            continue
-        summary["checked"] += 1
-        try:
-            smartlead_payload = lookup_smartlead_email(smartlead_api_key, email)
-        except Exception as exc:
-            if is_rate_limited_error(exc):
-                summary["rate_limited"] += 1
-                rate_limited = True
-                break
-            summary["lookup_errors"] += 1
+
+    remaining = max(limit, 0)
+    offset = 0
+    page_size = min(500, max(100, remaining or 500))
+    emails_index = smartlead_index.get("emails") or {}
+    handles_index = smartlead_index.get("handles") or {}
+
+    while True:
+        batch_limit = page_size if remaining == 0 else min(page_size, remaining)
+        if batch_limit <= 0:
+            break
+        rows = supabase.fetch_smartlead_sync_candidates(limit=batch_limit, offset=offset)
+        if not rows:
+            break
+        summary["candidates"] += len(rows)
+        for row in rows:
+            email = (row.get("email") or "").strip().lower()
+            handle = normalize_instagram_handle(row.get("instagram_handle"))
+            email_match = emails_index.get(email) if email else None
+            handle_match = handles_index.get(handle) if handle else None
+            match = email_match or handle_match
+            summary["checked"] += 1
+            if match:
+                payload = {
+                    "campaign_id": next(iter(match.get("campaign_ids") or []), ""),
+                    "memberships": match.get("memberships") or [],
+                }
+                if mark_smartlead_sent(
+                    supabase,
+                    row,
+                    payload,
+                    actor_role="worker",
+                    actor_identifier="finder_v1_worker",
+                ):
+                    summary["confirmed_sent"] += 1
+                    if email_match:
+                        summary["matched_by_email"] += 1
+                    elif handle_match:
+                        summary["matched_by_handle"] += 1
+                    matched_rows.append(
+                        {
+                            "id": row.get("id"),
+                            "email": email,
+                            "instagram_handle": row.get("instagram_handle"),
+                            "campaign_id": extract_campaign_id(payload),
+                            "match_type": "email" if email_match else "handle",
+                        }
+                    )
+                continue
+            summary["still_pending"] += 1
             unmatched_rows.append(
                 {
                     "id": row.get("id"),
                     "email": email,
                     "instagram_handle": row.get("instagram_handle"),
                     "review_status": row.get("review_status"),
-                    "error": str(exc),
                 }
             )
-            continue
-        if smartlead_payload.get("id"):
-            if mark_smartlead_sent(
-                supabase,
-                row,
-                smartlead_payload,
-                actor_role="worker",
-                actor_identifier="finder_v1_worker",
-            ):
-                summary["confirmed_sent"] += 1
-                matched_rows.append(
-                    {
-                        "id": row.get("id"),
-                        "email": email,
-                        "instagram_handle": row.get("instagram_handle"),
-                        "campaign_id": extract_campaign_id(smartlead_payload),
-                    }
-                )
-            if historical:
-                time.sleep(SMARTLEAD_HISTORICAL_SLEEP_SECONDS)
-            continue
-        summary["still_pending"] += 1
-        unmatched_rows.append(
-            {
-                "id": row.get("id"),
-                "email": email,
-                "instagram_handle": row.get("instagram_handle"),
-                "review_status": row.get("review_status"),
-            }
-        )
-        if historical:
-            time.sleep(SMARTLEAD_HISTORICAL_SLEEP_SECONDS)
+        offset += len(rows)
+        if remaining:
+            remaining -= len(rows)
+            if remaining <= 0:
+                break
+        if len(rows) < batch_limit:
+            break
     return {
         "historical": historical,
-        "rate_limited": rate_limited,
+        "rate_limited": False,
         "summary": dict(summary),
         "matched": matched_rows,
         "unmatched": unmatched_rows,
@@ -1559,16 +1568,6 @@ def run_smartlead_reconcile_command(limit: int, historical: bool) -> None:
         )
         if result.get("rate_limited"):
             outcome = "partial"
-        elif not historical:
-            historical_cleanup = reconcile_smartlead(
-                supabase,
-                cfg["smartlead_api_key"],
-                limit=min(DEFAULT_SMARTLEAD_HISTORICAL_CLEANUP_LIMIT, limit),
-                historical=True,
-            )
-            result["historical_cleanup"] = historical_cleanup
-            if historical_cleanup.get("rate_limited"):
-                outcome = "partial"
     except Exception:
         outcome = "error"
         raise
