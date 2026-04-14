@@ -5,6 +5,7 @@ This repo is the worker-only cloud deployment for `finder_v1`.
 It contains:
 - the Python lead-generation worker
 - the Supabase migration for Smartlead tracking
+- the Supabase migration for review/export state
 - systemd files for the DigitalOcean VM
 - simple cloud deployment docs
 
@@ -34,9 +35,16 @@ Run the DOC harvest:
 python3 -m finder_v1.main check-doc --limit 100
 ```
 
+Run the Smartlead reconcile:
+
+```bash
+python3 -m finder_v1.main reconcile-smartlead --limit 200
+```
+
 ## Repo layout
 
 - `finder_v1/`
 - `supabase/migrations/003_smartlead_tracking.sql`
+- `supabase/migrations/004_finder_review_app.sql`
 - `deploy/systemd/`
 - `docs/cloud-deploy.md`

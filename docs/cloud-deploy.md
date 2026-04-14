@@ -7,10 +7,11 @@ This is the simple worker-only deploy for the DigitalOcean VM.
 - one Python virtual environment
 - one local SQLite database on the VM
 - one environment file at `/etc/finder-v1.env`
-- three systemd jobs:
+- four systemd jobs:
   - `finder-v1-repair-on-boot.service`
   - `finder-v1-daily-run.timer`
   - `finder-v1-doc-harvest.timer`
+  - `finder-v1-smartlead-reconcile.timer`
 
 ## VM assumptions
 - VM host: DigitalOcean
@@ -26,6 +27,7 @@ Create `/etc/finder-v1.env` with:
 APIFY_API_TOKEN=
 ANTHROPIC_API_KEY=
 YOUTUBE_API_KEY=
+SMARTLEAD_API_KEY=
 SUPABASE_URL=
 SUPABASE_SERVICE_ROLE_KEY=
 FINDER_TIMEZONE=Asia/Makassar
@@ -51,11 +53,13 @@ FINDER_OUTPUT_BUCKET=finder-outputs
    - `finder-v1-repair-on-boot.service`
    - `finder-v1-daily-run.timer`
    - `finder-v1-doc-harvest.timer`
+   - `finder-v1-smartlead-reconcile.timer`
 
 ## What should happen
 - at boot: stale interrupted local state is repaired
 - at 02:00 Bali time: the daily run starts
 - every 30 minutes: pending DOC jobs are checked
+- every 10 minutes: pending Smartlead confirmations are reconciled
 - the worker writes plain status to Supabase
 - daily CSV/JSON outputs upload to the `finder-outputs` storage bucket
 
@@ -65,6 +69,7 @@ FINDER_OUTPUT_BUCKET=finder-outputs
 3. `python -m finder_v1.main repair-state`
 4. `systemctl list-timers --all | grep finder-v1`
 5. `systemctl start finder-v1-daily-run.service`
+6. `systemctl start finder-v1-smartlead-reconcile.service`
 
 ## Expected outputs
 - local:

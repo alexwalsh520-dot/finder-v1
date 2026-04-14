@@ -91,40 +91,91 @@ class SupabaseClient:
                 rows = []
         return {row["instagram_handle"]: row for row in rows}
 
+    def fetch_reviewable_leads(
+        self,
+        *,
+        limit: int,
+        review_status: str | None = None,
+        historical: bool = False,
+    ) -> List[Dict]:
+        filters = [
+            "select=id,instagram_handle,email,review_status,sent_to_smartlead,smartlead_campaign_id,smartlead_sent_at,export_batch_id",
+            "email=not.is.null",
+            "smartlead_sent_at=is.null",
+        ]
+        if historical:
+            filters.append("sent_to_smartlead=is.false")
+            filters.append("order=batch_date.asc.nullslast,created_at.asc")
+        else:
+            filters.append("review_status=eq.exported_pending_confirmation")
+            filters.append("order=created_at.desc")
+        if review_status:
+            filters.append(f"review_status=eq.{urllib.parse.quote(review_status)}")
+        filters.append(f"limit={limit}")
+        _, rows = self._request("GET", f"/leads?{'&'.join(filters)}")
+        return rows if isinstance(rows, list) else []
+
+    def update_lead_by_id(self, lead_id: str, payload: Dict) -> None:
+        self._request(
+            "PATCH",
+            f"/leads?id=eq.{urllib.parse.quote(lead_id)}",
+            body=payload,
+            extra_headers={"Prefer": "return=representation"},
+        )
+
+    def insert_lead_review_event(self, payload: Dict) -> None:
+        self._request(
+            "POST",
+            "/lead_review_events",
+            body=payload,
+            extra_headers={"Prefer": "return=representation"},
+        )
+
     def probe_leads_schema(self) -> Dict[str, object]:
         if not self.enabled():
             return {
                 "enabled": False,
                 "reachable": False,
                 "smartlead_tracking_fields": False,
+                "review_app_fields": False,
                 "error": "Supabase credentials are not configured.",
             }
-        advanced_path = "/leads?select=instagram_handle,sent_to_smartlead,smartlead_campaign_id,smartlead_sent_at&limit=1"
         basic_path = "/leads?select=instagram_handle&limit=1"
+        smartlead_path = "/leads?select=instagram_handle,sent_to_smartlead,smartlead_campaign_id,smartlead_sent_at&limit=1"
+        review_path = "/leads?select=instagram_handle,review_status,exported_at,export_batch_id&limit=1"
         try:
-            self._request("GET", advanced_path)
+            self._request("GET", basic_path)
+        except Exception as basic_error:
             return {
                 "enabled": True,
-                "reachable": True,
-                "smartlead_tracking_fields": True,
-                "error": "",
+                "reachable": False,
+                "smartlead_tracking_fields": False,
+                "review_app_fields": False,
+                "error": str(basic_error),
             }
-        except Exception as advanced_error:
-            try:
-                self._request("GET", basic_path)
-                return {
-                    "enabled": True,
-                    "reachable": True,
-                    "smartlead_tracking_fields": False,
-                    "error": str(advanced_error),
-                }
-            except Exception as basic_error:
-                return {
-                    "enabled": True,
-                    "reachable": False,
-                    "smartlead_tracking_fields": False,
-                    "error": str(basic_error),
-                }
+
+        smartlead_ok = True
+        review_ok = True
+        errors: list[str] = []
+        try:
+            self._request("GET", smartlead_path)
+        except Exception as exc:
+            smartlead_ok = False
+            errors.append(f"smartlead_fields: {exc}")
+
+        try:
+            self._request("GET", review_path)
+        except Exception as exc:
+            review_ok = False
+            errors.append(f"review_fields: {exc}")
+
+        return {
+            "enabled": True,
+            "reachable": True,
+            "smartlead_tracking_fields": smartlead_ok,
+            "review_app_fields": review_ok,
+            "error": "; ".join(errors),
+        }
 
     def count_today_emails_for_source(self, credited_date: str, source: str) -> int:
         path = f"/leads?select=id&email=not.is.null&batch_date=eq.{credited_date}&source=eq.{urllib.parse.quote(source)}"

@@ -26,6 +26,7 @@ Create `finder_v1/.env` with:
 APIFY_API_TOKEN=
 ANTHROPIC_API_KEY=
 YOUTUBE_API_KEY=
+SMARTLEAD_API_KEY=
 SUPABASE_URL=
 SUPABASE_SERVICE_ROLE_KEY=
 FINDER_TIMEZONE=Asia/Makassar
@@ -96,6 +97,12 @@ python3 -m finder_v1.main doctor
 python3 -m finder_v1.main repair-state
 ```
 
+8. Reconcile Smartlead sent state back into Supabase:
+
+```bash
+python3 -m finder_v1.main reconcile-smartlead --limit 200
+```
+
 Outputs:
 - `finder_v1/output/run_<id>_results.csv`
 - `finder_v1/output/run_<id>_audit.csv`
@@ -126,3 +133,4 @@ The upload paths look like:
 - `doctor` now checks Supabase Storage access in addition to the lead schema.
 - the worker writes plain status rows to `cron_jobs` and plain factual event rows to `agent_events` using the component name `finder_v1_worker`
 - If `doctor` says Smartlead tracking columns are missing, apply `/Users/alexwalsh/Documents/New project/supabase/migrations/003_smartlead_tracking.sql` in the Supabase SQL editor before cloud launch.
+- If `doctor` says review app fields are missing, apply `/Users/alexwalsh/Documents/New project/supabase/migrations/004_finder_review_app.sql` in the Supabase SQL editor before launching the review app.

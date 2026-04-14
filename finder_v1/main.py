@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import re
+import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,6 +17,7 @@ from .email_search import best_candidate, classify_email, deep_email_search, dis
 from .qualification import QUALIFICATION_VERSION, ai_qualification, deterministic_qualification
 from .reel_transcriber import download_media, profile_reel_posts, transcript_output_paths, write_json, write_simple_pdf
 from .runtime_lock import PipelineBusyError, pipeline_lock, read_lock_metadata
+from .smartlead import extract_campaign_id, is_rate_limited_error, lookup_smartlead_email
 from .supabase_client import SupabaseClient
 from .time_utils import business_now, next_business_time_iso, next_interval_iso, today_business_date, utc_now_iso
 from .youtube_search import search_channel
@@ -23,6 +25,9 @@ from .youtube_search import search_channel
 DEFAULT_DAILY_TARGET = 100
 DEFAULT_DAILY_BATCH_SIZE = 12
 DEFAULT_DOC_CHECK_LIMIT = 100
+DEFAULT_SMARTLEAD_RECONCILE_LIMIT = 200
+DEFAULT_SMARTLEAD_HISTORICAL_CLEANUP_LIMIT = 50
+SMARTLEAD_HISTORICAL_SLEEP_SECONDS = 1.5
 ZERO_PROGRESS_ROTATION_THRESHOLD = 2
 STALL_PROGRESS_MINUTES = 90
 DEFAULT_FALLBACK_SEEDS = [
@@ -38,8 +43,10 @@ DEFAULT_FALLBACK_SEEDS = [
 WORKER_COMPONENT = "finder_v1_worker"
 CRON_JOB_DAILY_ID = "finder-v1-daily-run"
 CRON_JOB_DOC_ID = "finder-v1-doc-harvest"
+CRON_JOB_SMARTLEAD_ID = "finder-v1-smartlead-reconcile"
 DAILY_RUN_SCHEDULE = "Daily 02:00 Bali time"
 DOC_HARVEST_SCHEDULE = "Every 30 minutes"
+SMARTLEAD_RECONCILE_SCHEDULE = "Every 10 minutes"
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,6 +65,10 @@ def parse_args() -> argparse.Namespace:
 
     check_doc_parser = subparsers.add_parser("check-doc", help="Poll pending DataOverCoffee jobs and harvest finished emails")
     check_doc_parser.add_argument("--limit", type=int, default=100, help="Maximum pending DOC jobs to check")
+
+    reconcile_parser = subparsers.add_parser("reconcile-smartlead", help="Check Smartlead and mark sent leads back into Supabase")
+    reconcile_parser.add_argument("--limit", type=int, default=DEFAULT_SMARTLEAD_RECONCILE_LIMIT, help="Maximum leads to check")
+    reconcile_parser.add_argument("--historical", action="store_true", help="Backfill old emailed leads that were already uploaded to Smartlead")
 
     subparsers.add_parser("refresh-results", help="Reclassify saved email candidates and rebuild the clean export")
     subparsers.add_parser("import-dashboard-db", help="Import delivered emails from the dashboard Supabase into the main outreach database")
@@ -506,6 +517,130 @@ def clear_creator_email_in_supabase(
     except Exception as exc:
         counts["supabase_sync_errors"] += 1
         print(f"  Supabase clear failed for @{handle}: {exc}")
+
+
+def mark_smartlead_sent(
+    supabase: SupabaseClient,
+    row: Dict[str, Any],
+    smartlead_payload: Dict[str, Any],
+    *,
+    actor_role: str,
+    actor_identifier: str,
+) -> bool:
+    lead_id = str(row.get("id") or "").strip()
+    if not lead_id:
+        return False
+    patch: Dict[str, Any] = {
+        "sent_to_smartlead": True,
+        "smartlead_sent_at": row.get("smartlead_sent_at") or utc_now_iso(),
+    }
+    campaign_id = extract_campaign_id(smartlead_payload)
+    if campaign_id:
+        patch["smartlead_campaign_id"] = campaign_id
+    current_status = (row.get("review_status") or "").strip()
+    if current_status in {"unreviewed", "va_approved", "flagged", "exported_pending_confirmation", ""}:
+        patch["review_status"] = "approved"
+    supabase.update_lead_by_id(lead_id, patch)
+    try:
+        supabase.insert_lead_review_event(
+            {
+                "lead_id": lead_id,
+                "actor_role": actor_role,
+                "actor_identifier": actor_identifier,
+                "action": "smartlead_confirmed",
+                "payload": {
+                    "email": row.get("email"),
+                    "instagram_handle": row.get("instagram_handle"),
+                    "campaign_id": campaign_id,
+                    "previous_review_status": current_status,
+                },
+            }
+        )
+    except Exception:
+        pass
+    return True
+
+
+def reconcile_smartlead(
+    supabase: SupabaseClient,
+    smartlead_api_key: str,
+    *,
+    limit: int,
+    historical: bool,
+) -> Dict[str, Any]:
+    if not supabase.enabled():
+        raise RuntimeError("Supabase credentials are not configured.")
+    if not smartlead_api_key:
+        raise RuntimeError("SMARTLEAD_API_KEY is not configured.")
+
+    rows = supabase.fetch_reviewable_leads(limit=limit, historical=historical)
+    summary = Counter()
+    summary["candidates"] = len(rows)
+    matched_rows: List[Dict[str, Any]] = []
+    unmatched_rows: List[Dict[str, Any]] = []
+    rate_limited = False
+    for row in rows:
+        email = (row.get("email") or "").strip().lower()
+        if not email:
+            summary["skipped_missing_email"] += 1
+            continue
+        summary["checked"] += 1
+        try:
+            smartlead_payload = lookup_smartlead_email(smartlead_api_key, email)
+        except Exception as exc:
+            if is_rate_limited_error(exc):
+                summary["rate_limited"] += 1
+                rate_limited = True
+                break
+            summary["lookup_errors"] += 1
+            unmatched_rows.append(
+                {
+                    "id": row.get("id"),
+                    "email": email,
+                    "instagram_handle": row.get("instagram_handle"),
+                    "review_status": row.get("review_status"),
+                    "error": str(exc),
+                }
+            )
+            continue
+        if smartlead_payload.get("id"):
+            if mark_smartlead_sent(
+                supabase,
+                row,
+                smartlead_payload,
+                actor_role="worker",
+                actor_identifier="finder_v1_worker",
+            ):
+                summary["confirmed_sent"] += 1
+                matched_rows.append(
+                    {
+                        "id": row.get("id"),
+                        "email": email,
+                        "instagram_handle": row.get("instagram_handle"),
+                        "campaign_id": extract_campaign_id(smartlead_payload),
+                    }
+                )
+            if historical:
+                time.sleep(SMARTLEAD_HISTORICAL_SLEEP_SECONDS)
+            continue
+        summary["still_pending"] += 1
+        unmatched_rows.append(
+            {
+                "id": row.get("id"),
+                "email": email,
+                "instagram_handle": row.get("instagram_handle"),
+                "review_status": row.get("review_status"),
+            }
+        )
+        if historical:
+            time.sleep(SMARTLEAD_HISTORICAL_SLEEP_SECONDS)
+    return {
+        "historical": historical,
+        "rate_limited": rate_limited,
+        "summary": dict(summary),
+        "matched": matched_rows,
+        "unmatched": unmatched_rows,
+    }
 
 
 def refresh_saved_results(db: FinderDB, supabase: SupabaseClient | None = None) -> Counter:
@@ -1205,7 +1340,7 @@ def build_status_payload(db: FinderDB, supabase: SupabaseClient, day: str, bucke
         "worker_jobs": {},
     }
     if supabase.enabled():
-        for job_id in (CRON_JOB_DAILY_ID, CRON_JOB_DOC_ID):
+        for job_id in (CRON_JOB_DAILY_ID, CRON_JOB_DOC_ID, CRON_JOB_SMARTLEAD_ID):
             try:
                 rows = supabase.fetch_rows(
                     "cron_jobs",
@@ -1279,6 +1414,7 @@ def run_doctor() -> None:
         "apify_token": bool(cfg["apify_token"]),
         "anthropic_key": bool(cfg["anthropic_key"]),
         "youtube_key": bool(cfg["youtube_key"]),
+        "smartlead_key": bool(cfg["smartlead_api_key"]),
         "supabase": supabase.enabled(),
         "finder_timezone": cfg["finder_timezone"],
         "finder_output_bucket": cfg["finder_output_bucket"],
@@ -1305,10 +1441,14 @@ def run_doctor() -> None:
         action_items.append("Add SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY before cloud deployment.")
     if schema.get("enabled") and not schema.get("smartlead_tracking_fields"):
         action_items.append("Apply /Users/alexwalsh/Documents/New project/supabase/migrations/003_smartlead_tracking.sql in the Supabase SQL editor.")
+    if schema.get("enabled") and not schema.get("review_app_fields"):
+        action_items.append("Apply /Users/alexwalsh/Documents/New project/supabase/migrations/004_finder_review_app.sql in the Supabase SQL editor.")
     if env["finder_output_bucket"] and storage.get("enabled") and not storage.get("bucket_exists"):
         action_items.append("Create the Supabase Storage bucket named by FINDER_OUTPUT_BUCKET before cloud deployment, or let the deployment script create it.")
     if not env["finder_output_bucket"]:
         action_items.append("Set FINDER_OUTPUT_BUCKET before cloud deployment so daily files are uploaded to the cloud.")
+    if not env["smartlead_key"]:
+        action_items.append("Add SMARTLEAD_API_KEY before enabling automatic Smartlead reconciliation.")
     if read_lock_metadata(LOCK_PATH):
         action_items.append("A pipeline lock is currently present. Make sure no old daily-run process is still active before cloud deployment.")
     if int(local_state["unfinished_runs"] or 0) > 0 and not read_lock_metadata(LOCK_PATH):
@@ -1335,6 +1475,11 @@ def run_doctor() -> None:
             and storage.get("bucket_exists")
         ),
         "schema_ready": bool(schema.get("smartlead_tracking_fields")),
+        "review_app_ready": bool(
+            env["smartlead_key"]
+            and schema.get("smartlead_tracking_fields")
+            and schema.get("review_app_fields")
+        ),
     }
     print(json.dumps({
         "environment": env,
@@ -1386,6 +1531,73 @@ def run_repair_state() -> None:
         "repaired_days": repaired_days,
         "repaired_at": now,
     }, indent=2))
+
+
+def run_smartlead_reconcile_command(limit: int, historical: bool) -> None:
+    ensure_dirs()
+    cfg = api_config()
+    supabase = SupabaseClient(cfg["supabase_url"], cfg["supabase_service_role_key"])
+    started_at = utc_now_iso()
+    sync_worker_job_status(
+        supabase,
+        CRON_JOB_SMARTLEAD_ID,
+        name="Finder V1 Smartlead Reconcile",
+        schedule=SMARTLEAD_RECONCILE_SCHEDULE,
+        status="running",
+        started_at=started_at,
+        next_run_at=next_interval_iso(10),
+        increment_run_count=not historical,
+    )
+    outcome = "success"
+    result: Dict[str, Any] = {"historical": historical, "summary": {}}
+    try:
+        result = reconcile_smartlead(
+            supabase,
+            cfg["smartlead_api_key"],
+            limit=limit,
+            historical=historical,
+        )
+        if result.get("rate_limited"):
+            outcome = "partial"
+        elif not historical:
+            historical_cleanup = reconcile_smartlead(
+                supabase,
+                cfg["smartlead_api_key"],
+                limit=min(DEFAULT_SMARTLEAD_HISTORICAL_CLEANUP_LIMIT, limit),
+                historical=True,
+            )
+            result["historical_cleanup"] = historical_cleanup
+            if historical_cleanup.get("rate_limited"):
+                outcome = "partial"
+    except Exception:
+        outcome = "error"
+        raise
+    finally:
+        sync_worker_job_status(
+            supabase,
+            CRON_JOB_SMARTLEAD_ID,
+            name="Finder V1 Smartlead Reconcile",
+            schedule=SMARTLEAD_RECONCILE_SCHEDULE,
+            status=outcome,
+            started_at=started_at,
+            next_run_at=next_interval_iso(10),
+        )
+        log_worker_event(
+            supabase,
+            "smartlead_backfill_completed" if historical and outcome == "success" else (
+                "smartlead_backfill_partial" if historical and outcome == "partial" else (
+                "smartlead_reconcile_completed" if outcome == "success" else "smartlead_reconcile_failed"
+                )
+            ),
+            "warning" if outcome == "partial" else ("ok" if outcome == "success" else "error"),
+            {
+                "day": today_business_date(),
+                "historical": historical,
+                "limit": limit,
+                **result,
+            },
+        )
+    print(json.dumps(result, indent=2))
 
 
 def run_seed_cycle(
@@ -2053,6 +2265,8 @@ def main() -> None:
             run_doctor()
         elif args.command == "repair-state":
             run_repair_state()
+        elif args.command == "reconcile-smartlead":
+            run_smartlead_reconcile_command(args.limit, args.historical)
         elif args.command == "run":
             seeds = [s.strip().lower().replace("@", "") for s in args.seeds.split(",") if s.strip()]
             if not seeds:

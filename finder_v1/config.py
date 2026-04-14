@@ -124,6 +124,7 @@ def api_config() -> Dict[str, str]:
         "anthropic_key": os.environ.get("ANTHROPIC_API_KEY", ""),
         "groq_key": os.environ.get("GROQ_API_KEY", ""),
         "youtube_key": os.environ.get("YOUTUBE_API_KEY", ""),
+        "smartlead_api_key": os.environ.get("SMARTLEAD_API_KEY", ""),
         "supabase_url": os.environ.get("SUPABASE_URL", ""),
         "supabase_service_role_key": os.environ.get("SUPABASE_SERVICE_ROLE_KEY", ""),
         "finder_timezone": business_timezone_name(),
