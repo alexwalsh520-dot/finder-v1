@@ -6,6 +6,7 @@ It contains:
 - the Python lead-generation worker
 - the Supabase migration for Smartlead tracking
 - the Supabase migration for review/export state
+- the Supabase migration for one-time qualified seed expansion
 - systemd files for the DigitalOcean VM
 - simple cloud deployment docs
 
@@ -46,5 +47,6 @@ python3 -m finder_v1.main reconcile-smartlead --limit 200
 - `finder_v1/`
 - `supabase/migrations/003_smartlead_tracking.sql`
 - `supabase/migrations/004_finder_review_app.sql`
+- `supabase/migrations/006_discovery_seed_expansions.sql`
 - `deploy/systemd/`
 - `docs/cloud-deploy.md`

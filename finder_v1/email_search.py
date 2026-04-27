@@ -11,6 +11,9 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from .config import JUNK_EMAIL_PATTERNS, KNOWN_BRAND_DOMAINS, LEGAL_PATHS, MANAGEMENT_HINTS, PLATFORM_DOMAINS, SOCIAL_HOSTS, SUBPAGE_HINTS
 
 
+REVIEWABLE_EMAIL_TYPES = {"personal", "management", "generic_business", "brand"}
+
+
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 LINK_RE = re.compile(r"""href=["']([^"'#]+)["']""", re.I)
 YOUTUBE_RE = re.compile(r"https?://(?:www\.)?(?:youtube\.com|youtu\.be)/[^\s\"'<>]+", re.I)
@@ -114,16 +117,28 @@ def source_matches_email_domain(email_host: str, source_url: str) -> bool:
 
 def classify_email(email: str, source_url: str) -> Tuple[str, str]:
     lower = email.lower()
+    if "@" not in lower:
+        return "junk", "Email is malformed."
     local_part, host = lower.split("@", 1)
     source_kind = url_kind(source_url) if source_url else ""
     host_kind = email_host_kind(host)
+    placeholder_locals = {
+        "name", "user", "you", "yourname", "email", "test", "example",
+        "first", "firstname", "last", "lastname", "first.last", "john",
+        "jane", "john.doe", "jane.doe",
+    }
+    placeholder_hosts = {"domain.com", "email.com"}
     generic_locals = {
         "cs", "ops", "office", "team", "admin", "info", "hello", "contact",
         "support", "sales", "customerservice", "privacy", "legal", "copyright",
-        "terms", "gdpr",
+        "terms", "gdpr", "creators", "ecommerce", "anfragen",
     }
     management_locals = {"booking", "bookings", "management", "mgmt", "agent", "agents", "inquiries", "inquiry", "partnerships", "partnership"}
 
+    if local_part in placeholder_locals or host in placeholder_hosts:
+        return "junk", "Email looks like a placeholder instead of a real inbox."
+    if local_part == "name" and host == "mail.com":
+        return "junk", "Email looks like a placeholder instead of a real inbox."
     if host_kind == "junk":
         return "junk", "Email looks like a monitoring, platform artifact, or other scraping garbage."
     if host_kind == "platform":
@@ -142,7 +157,13 @@ def classify_email(email: str, source_url: str) -> Tuple[str, str]:
         if source_matches_email_domain(host, source_url):
             return "generic_business", "Email is a creator-site generic inbox, not a direct personal address."
         return "generic_business", "Email is a generic business inbox instead of a direct creator or management contact."
+    if local_part.startswith("preview."):
+        return "generic_business", "Email looks like a shared preview or early-access inbox."
     return "personal", "Email appears to be a direct or creator-owned address."
+
+
+def is_reviewable_email_type(email_type: str | None) -> bool:
+    return (email_type or "").strip().lower() in REVIEWABLE_EMAIL_TYPES
 
 
 def extract_links(html_text: str, base_url: str) -> List[str]:
@@ -193,8 +214,8 @@ def collect_candidate_sites(html_text: str, base_url: str) -> List[str]:
     return candidates[:4]
 
 
-def search_page(url: str, source_method: str, path_label: str) -> List[Dict[str, str]]:
-    html_text = fetch_text(url)
+def search_page(url: str, source_method: str, path_label: str, html_text: Optional[str] = None) -> List[Dict[str, str]]:
+    html_text = html_text if html_text is not None else fetch_text(url)
     if not html_text:
         return []
     results = []
@@ -247,12 +268,13 @@ def deep_email_search(profile: Dict[str, object]) -> List[Dict[str, str]]:
             continue
         page_kind = url_kind(start_url)
         source_method = "link_hub" if page_kind == "platform" else "site"
-        candidates.extend(search_page(start_url, source_method, "home"))
+        candidates.extend(search_page(start_url, source_method, "home", start_html))
 
         if page_kind == "platform":
             for linked_site in collect_candidate_sites(start_html, start_url):
-                candidates.extend(search_page(linked_site, "linked_site", "home"))
-                subpages = candidate_subpages(fetch_text(linked_site) or "", linked_site)
+                linked_html = fetch_text(linked_site) or ""
+                candidates.extend(search_page(linked_site, "linked_site", "home", linked_html))
+                subpages = candidate_subpages(linked_html, linked_site)
                 for subpage in subpages:
                     candidates.extend(search_page(subpage, "linked_site_subpage", urllib.parse.urlparse(subpage).path or "/"))
         elif page_kind == "personal":
@@ -313,7 +335,7 @@ def best_candidate(candidates: Iterable[Dict[str, str]]) -> Optional[Dict[str, s
         "brand": 4,
         "junk": 5,
     }
-    filtered = [c for c in candidates if c["email_type"] in ("personal", "management")]
+    filtered = [c for c in candidates if is_reviewable_email_type(c.get("email_type"))]
     if not filtered:
         return None
     return sorted(filtered, key=lambda c: (ranking.get(c["email_type"], 9), c["source_method"], c["source_path"]))[0]

@@ -7,14 +7,29 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 
+REVIEWABLE_EMAIL_TYPES_SQL = "'personal', 'management', 'generic_business', 'brand'"
+REVIEWABLE_EMAIL_TYPES = {"personal", "management", "generic_business", "brand"}
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
 class FinderDB:
     def __init__(self, path: Path):
-        self.conn = sqlite3.connect(path)
+        self.conn = sqlite3.connect(path, timeout=30.0)
         self.conn.row_factory = sqlite3.Row
+        self._configure_connection()
+
+    def _configure_connection(self) -> None:
+        # The worker checkpoints state frequently for crash recovery. WAL + NORMAL
+        # avoids the rollback-journal fsync pattern that can wedge long VM runs.
+        self.conn.execute("pragma busy_timeout = 30000")
+        self.conn.execute("pragma temp_store = memory")
+        self.conn.execute("pragma journal_mode = wal")
+        self.conn.execute("pragma synchronous = normal")
+        self.conn.execute("pragma wal_autocheckpoint = 1000")
+        self.conn.execute("pragma journal_size_limit = 67108864")
 
     def init(self) -> None:
         self.conn.executescript(
@@ -114,6 +129,8 @@ class FinderDB:
               total_enriched integer not null default 0,
               total_qualified integer not null default 0,
               total_kept integer not null default 0,
+              total_skipped_existing_live integer not null default 0,
+              total_duplicate_emails integer not null default 0,
               total_doc_submitted integer not null default 0,
               total_doc_harvested integer not null default 0,
               last_used_at text,
@@ -128,6 +145,8 @@ class FinderDB:
               enriched integer not null default 0,
               qualified integer not null default 0,
               kept integer not null default 0,
+              skipped_existing_live integer not null default 0,
+              duplicate_emails integer not null default 0,
               doc_submitted integer not null default 0,
               doc_harvested integer not null default 0,
               last_outcome text,
@@ -136,7 +155,54 @@ class FinderDB:
             );
             """
         )
+        self._ensure_column("creators", "best_email_found_at", "text")
+        self._ensure_column("seed_performance", "total_skipped_existing_live", "integer not null default 0")
+        self._ensure_column("seed_performance", "total_duplicate_emails", "integer not null default 0")
+        self._ensure_column("seed_usage", "skipped_existing_live", "integer not null default 0")
+        self._ensure_column("seed_usage", "duplicate_emails", "integer not null default 0")
+        self.conn.execute(
+            """
+            update creators
+            set best_email_found_at = coalesce(best_email_found_at, contact_searched_at, discovered_at, updated_at)
+            where best_email is not null
+              and best_email_type in ('personal', 'management', 'generic_business', 'brand')
+            """
+        )
+        self.conn.execute(
+            "create index if not exists idx_creators_best_email_found_at on creators(best_email_found_at)"
+        )
         self.conn.commit()
+
+    def _ensure_column(self, table: str, column: str, column_sql: str) -> None:
+        existing = {
+            row["name"]
+            for row in self.conn.execute(f"pragma table_info({table})").fetchall()
+        }
+        if column not in existing:
+            self.conn.execute(f"alter table {table} add column {column} {column_sql}")
+
+    @staticmethod
+    def _same_best_email(existing: Optional[sqlite3.Row], email: Optional[str], email_type: Optional[str]) -> bool:
+        if not existing or not email:
+            return False
+        current_email = (existing["best_email"] or "").strip().lower()
+        next_email = (email or "").strip().lower()
+        current_type = (existing["best_email_type"] or "").strip().lower()
+        next_type = (email_type or "").strip().lower()
+        return current_email == next_email and current_type == next_type
+
+    def _next_best_email_found_at(
+        self,
+        existing: Optional[sqlite3.Row],
+        email: Optional[str],
+        email_type: Optional[str],
+        now: str,
+    ) -> Optional[str]:
+        if not email or email_type not in REVIEWABLE_EMAIL_TYPES:
+            return None
+        if self._same_best_email(existing, email, email_type):
+            return existing["best_email_found_at"] or existing["contact_searched_at"] or now
+        return now
 
     def create_run(self, seeds: List[str], target_emails: int) -> int:
         cur = self.conn.execute(
@@ -235,14 +301,16 @@ class FinderDB:
     ) -> None:
         now = utc_now()
         stage = "contact_found" if email else "contact_none"
+        existing = self.get_creator(handle)
+        best_email_found_at = self._next_best_email_found_at(existing, email, email_type, now)
         self.conn.execute(
             """
             update creators
             set best_email = ?, best_email_type = ?, best_email_source = ?, best_email_notes = ?,
-                contact_searched_at = ?, stage = ?, updated_at = ?
+                best_email_found_at = ?, contact_searched_at = ?, stage = ?, updated_at = ?
             where handle = ?
             """,
-            (email, email_type, source, notes, now, stage, now, handle),
+            (email, email_type, source, notes, best_email_found_at, now, stage, now, handle),
         )
         self.conn.commit()
 
@@ -377,7 +445,15 @@ class FinderDB:
             select *
             from doc_jobs
             where completed_at is null
-            order by submitted_at asc
+            order by
+              case when coalesce(results_collected, 0) > 0 then 0 else 1 end asc,
+              case
+                when lower(coalesce(doc_status, '')) in ('ready', 'succeeded', 'success', 'completed', 'done') then 0
+                when lower(coalesce(doc_status, '')) = 'forbidden' then 2
+                else 1
+              end asc,
+              coalesce(last_checked_at, submitted_at) asc,
+              submitted_at asc
             """
         ).fetchall()
 
@@ -490,14 +566,15 @@ class FinderDB:
             stage = "contact_found"
         elif creator["qualified"] == 1:
             stage = "contact_none"
+        best_email_found_at = self._next_best_email_found_at(creator, email, email_type, utc_now())
         self.conn.execute(
             """
             update creators
             set best_email = ?, best_email_type = ?, best_email_source = ?, best_email_notes = ?,
-                stage = ?, updated_at = ?
+                best_email_found_at = ?, stage = ?, updated_at = ?
             where handle = ?
             """,
-            (email, email_type, source, notes, stage, utc_now(), handle),
+            (email, email_type, source, notes, best_email_found_at, stage, utc_now(), handle),
         )
         self.conn.commit()
 
@@ -515,7 +592,7 @@ class FinderDB:
 
     def count_kept_emails_for_run(self) -> int:
         row = self.conn.execute(
-            "select count(*) as count from creators where best_email is not null and best_email_type in ('personal', 'management')"
+            f"select count(*) as count from creators where best_email is not null and best_email_type in ({REVIEWABLE_EMAIL_TYPES_SQL})"
         ).fetchone()
         return int(row["count"] if row else 0)
 
@@ -526,7 +603,31 @@ class FinderDB:
             from creators
             where updated_at >= ?
               and best_email is not null
-              and best_email_type in ('personal', 'management')
+              and best_email_type in ('personal', 'management', 'generic_business', 'brand')
+            """,
+            (started_at,),
+        ).fetchone()
+        return int(row["count"] if row else 0)
+
+    def count_new_emails_found_since(self, started_at: str) -> int:
+        row = self.conn.execute(
+            """
+            select count(*) as count
+            from creators
+            where best_email_found_at >= ?
+              and best_email is not null
+              and best_email_type in ('personal', 'management', 'generic_business', 'brand')
+            """,
+            (started_at,),
+        ).fetchone()
+        return int(row["count"] if row else 0)
+
+    def count_creators_discovered_since(self, started_at: str) -> int:
+        row = self.conn.execute(
+            """
+            select count(*) as count
+            from creators
+            where discovered_at >= ?
             """,
             (started_at,),
         ).fetchone()
@@ -598,6 +699,8 @@ class FinderDB:
         enriched: int,
         qualified: int,
         kept: int,
+        skipped_existing_live: int,
+        duplicate_emails: int,
         doc_submitted: int,
         doc_harvested: int,
         outcome: str,
@@ -607,14 +710,16 @@ class FinderDB:
             """
             insert into seed_usage(
               day, seed_handle, cycle_index, discovered, enriched, qualified, kept,
-              doc_submitted, doc_harvested, last_outcome, used_at
-            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              skipped_existing_live, duplicate_emails, doc_submitted, doc_harvested, last_outcome, used_at
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             on conflict(day, seed_handle) do update set
               cycle_index = excluded.cycle_index,
               discovered = excluded.discovered,
               enriched = excluded.enriched,
               qualified = excluded.qualified,
               kept = excluded.kept,
+              skipped_existing_live = excluded.skipped_existing_live,
+              duplicate_emails = excluded.duplicate_emails,
               doc_submitted = excluded.doc_submitted,
               doc_harvested = excluded.doc_harvested,
               last_outcome = excluded.last_outcome,
@@ -628,6 +733,8 @@ class FinderDB:
                 enriched,
                 qualified,
                 kept,
+                skipped_existing_live,
+                duplicate_emails,
                 doc_submitted,
                 doc_harvested,
                 outcome,
@@ -647,7 +754,7 @@ class FinderDB:
         return self.conn.execute(
             """
             select day, seed_handle, cycle_index, discovered, enriched, qualified, kept,
-                   doc_submitted, doc_harvested, last_outcome, used_at
+                   skipped_existing_live, duplicate_emails, doc_submitted, doc_harvested, last_outcome, used_at
             from seed_usage
             where day = ?
             order by used_at asc, seed_handle asc
@@ -663,6 +770,8 @@ class FinderDB:
         enriched: int,
         qualified: int,
         kept: int,
+        skipped_existing_live: int,
+        duplicate_emails: int,
         doc_submitted: int,
         doc_harvested: int,
     ) -> None:
@@ -680,6 +789,8 @@ class FinderDB:
                     total_enriched = total_enriched + ?,
                     total_qualified = total_qualified + ?,
                     total_kept = total_kept + ?,
+                    total_skipped_existing_live = total_skipped_existing_live + ?,
+                    total_duplicate_emails = total_duplicate_emails + ?,
                     total_doc_submitted = total_doc_submitted + ?,
                     total_doc_harvested = total_doc_harvested + ?,
                     last_used_at = ?,
@@ -691,6 +802,8 @@ class FinderDB:
                     enriched,
                     qualified,
                     kept,
+                    skipped_existing_live,
+                    duplicate_emails,
                     doc_submitted,
                     doc_harvested,
                     now,
@@ -703,8 +816,9 @@ class FinderDB:
                 """
                 insert into seed_performance(
                   seed_handle, total_runs, total_discovered, total_enriched, total_qualified,
-                  total_kept, total_doc_submitted, total_doc_harvested, last_used_at, updated_at
-                ) values (?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+                  total_kept, total_skipped_existing_live, total_duplicate_emails,
+                  total_doc_submitted, total_doc_harvested, last_used_at, updated_at
+                ) values (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     seed_handle,
@@ -712,6 +826,8 @@ class FinderDB:
                     enriched,
                     qualified,
                     kept,
+                    skipped_existing_live,
+                    duplicate_emails,
                     doc_submitted,
                     doc_harvested,
                     now,
@@ -733,8 +849,36 @@ class FinderDB:
         return self.conn.execute(
             """
             select handle, source_seed, followers, qualified, reject_reason, best_email, best_email_type,
-                   best_email_source, best_email_notes, profile_json, stage
+                   best_email_source, best_email_notes, best_email_found_at, profile_json, stage
             from creators
             order by coalesce(followers, 0) desc, handle asc
             """
         )
+
+    def iter_new_export_rows(self, started_at: str) -> Iterable[sqlite3.Row]:
+        return self.conn.execute(
+            """
+            select handle, source_seed, followers, qualified, reject_reason, best_email, best_email_type,
+                   best_email_source, best_email_notes, best_email_found_at, profile_json, stage
+            from creators
+            where best_email_found_at >= ?
+              and best_email is not null
+              and best_email_type in ('personal', 'management', 'generic_business', 'brand')
+            order by coalesce(followers, 0) desc, handle asc
+            """,
+            (started_at,),
+        )
+
+    def summarize_open_doc_jobs(self) -> Dict[str, int]:
+        summary: Dict[str, int] = {"pending_total": self.count_pending_doc_jobs()}
+        rows = self.conn.execute(
+            """
+            select lower(coalesce(doc_status, 'unknown')) as doc_status, count(*) as count
+            from doc_jobs
+            where completed_at is null
+            group by lower(coalesce(doc_status, 'unknown'))
+            """
+        ).fetchall()
+        for row in rows:
+            summary[f"doc_status_{row['doc_status']}"] = int(row["count"] or 0)
+        return summary

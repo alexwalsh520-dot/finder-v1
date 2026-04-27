@@ -25,7 +25,6 @@ Create `/etc/finder-v1.env` with:
 
 ```env
 APIFY_API_TOKEN=
-ANTHROPIC_API_KEY=
 YOUTUBE_API_KEY=
 SMARTLEAD_API_KEY=
 SUPABASE_URL=
@@ -33,8 +32,6 @@ SUPABASE_SERVICE_ROLE_KEY=
 FINDER_TIMEZONE=Asia/Makassar
 FINDER_OUTPUT_BUCKET=finder-outputs
 ```
-
-`ANTHROPIC_API_KEY` is optional.
 
 ## Initial setup
 1. Install base packages:
@@ -46,10 +43,11 @@ FINDER_OUTPUT_BUCKET=finder-outputs
 4. Clone the worker repo into `/opt/finder-v1`.
 5. Create the virtual environment:
    - `python3 -m venv /opt/finder-v1/.venv`
-6. Activate the venv and run a smoke check:
+6. Apply the Supabase migrations, including `006_discovery_seed_expansions.sql`.
+7. Activate the venv and run a smoke check:
    - `/opt/finder-v1/.venv/bin/python -m finder_v1.main doctor`
-7. Copy the systemd files from `deploy/systemd/` into `/etc/systemd/system/`.
-8. Reload systemd and enable:
+8. Copy the systemd files from `deploy/systemd/` into `/etc/systemd/system/`.
+9. Reload systemd and enable:
    - `finder-v1-repair-on-boot.service`
    - `finder-v1-daily-run.timer`
    - `finder-v1-doc-harvest.timer`
@@ -58,7 +56,8 @@ FINDER_OUTPUT_BUCKET=finder-outputs
 ## What should happen
 - at boot: stale interrupted local state is repaired
 - at 02:00 Bali time: the daily run starts
-- every 30 minutes: pending DOC jobs are checked
+- daily discovery uses human-qualified Supabase leads as one-time related-account seeds
+- every 30 minutes at `:05` and `:35`: pending DOC jobs are checked
 - every 10 minutes: pending Smartlead confirmations are reconciled
 - the worker writes plain status to Supabase
 - daily CSV/JSON outputs upload to the `finder-outputs` storage bucket

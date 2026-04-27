@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import csv
 import os
-import re
 from pathlib import Path
 from typing import Dict, List
 
@@ -16,7 +14,6 @@ LOCK_PATH = STATE_DIR / "pipeline.lock"
 SIMILAR_ACTOR = "thenetaji/instagram-related-user-scraper"
 ENRICH_ACTOR = "apify/instagram-profile-scraper"
 DOC_ACTOR = "dataovercoffee/youtube-channel-business-email-scraper"
-ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
 
 MIN_FOLLOWERS = 100_000
 
@@ -36,6 +33,7 @@ PLATFORM_DOMAINS = [
     "cameo.com", "calendly.com", "typeform.com", "google.com", "docs.google.com",
     "forms.gle", "linktr.ee", "beacons.ai", "stan.store", "mailchimp.com",
     "hoo.be", "lnk.bio", "bio.site", "link.me", "bit.ly", "komi.io",
+    "skool.com",
 ]
 
 SOCIAL_HOSTS = [
@@ -52,24 +50,6 @@ LEGAL_PATHS = [
 SUBPAGE_HINTS = [
     "contact", "about", "privacy", "terms", "legal", "impressum", "work",
     "booking", "media", "kit", "hire", "inquiry",
-]
-
-PERSON_HINTS = [
-    "coach", "athlete", "trainer", "founder", "creator", "host", "dad", "mom",
-    "girl", "guy", "ceo", "nutrition", "physique", "bodybuilding", "fitness",
-    "bodybuilder", "ifbb", "pro", "champ", "champion", "olympia",
-]
-
-BRAND_REJECT_HINTS = [
-    "official page", "shop now", "order now", "shipping worldwide", "store",
-    "supplements", "apparel", "magazine", "news", "fan page", "tribute",
-    "memorial", "brand", "company", "team account",
-]
-
-FITNESS_SIGNALS = [
-    "fitness", "gym", "workout", "training", "coach", "coaching", "physique",
-    "bodybuilding", "lifting", "strength", "hypertrophy", "protein", "macro",
-    "prep", "athlete", "muscle", "recomp", "powerlifting", "wellness",
 ]
 
 NON_ENGLISH_HINTS = [
@@ -90,9 +70,6 @@ JUNK_EMAIL_PATTERNS = [
     "name@gmail.com", "yourname@", "email@email", "test@", "example@",
     "sentry-next.wixpress.com", "ingest.sentry.io",
 ]
-
-TRUE_VALUES = {"1", "true", "yes", "on"}
-
 
 def ensure_dirs() -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -121,7 +98,6 @@ def api_config() -> Dict[str, str]:
     load_env()
     return {
         "apify_token": os.environ.get("APIFY_API_TOKEN", ""),
-        "anthropic_key": os.environ.get("ANTHROPIC_API_KEY", ""),
         "groq_key": os.environ.get("GROQ_API_KEY", ""),
         "youtube_key": os.environ.get("YOUTUBE_API_KEY", ""),
         "smartlead_api_key": os.environ.get("SMARTLEAD_API_KEY", ""),
@@ -147,39 +123,3 @@ def safe_json_text(value: object) -> str:
 
 def flatten_text_parts(parts: List[str]) -> str:
     return " ".join(p.strip() for p in parts if p and p.strip())
-
-
-def require_green_light_brand_in_bio() -> bool:
-    load_env()
-    return os.environ.get("REQUIRE_GREEN_LIGHT_BRAND_IN_BIO", "").strip().lower() in TRUE_VALUES
-
-
-def green_light_brands_file() -> Path | None:
-    load_env()
-    raw = os.environ.get("GREEN_LIGHT_BRANDS_FILE", "").strip()
-    if not raw:
-        return None
-    return Path(raw).expanduser()
-
-
-def _normalize_brand_token(value: str) -> str:
-    text = (value or "").strip().lower()
-    text = re.sub(r"^https?://(www\.)?(instagram\.com/)?", "", text)
-    text = text.split("/", 1)[0]
-    text = text.lstrip("@#")
-    text = re.sub(r"[^a-z0-9._]", "", text)
-    return text
-
-
-def load_green_light_brands() -> List[str]:
-    brands: List[str] = []
-    path = green_light_brands_file()
-    if path and path.exists() and path.is_file():
-        for line in path.read_text(errors="ignore").splitlines():
-            for cell in csv.reader([line]).__next__():
-                normalized = _normalize_brand_token(cell)
-                if normalized and normalized not in brands:
-                    brands.append(normalized)
-    if not brands:
-        brands = [_normalize_brand_token(brand) for brand in KNOWN_BRAND_DOMAINS]
-    return [brand for brand in brands if brand]

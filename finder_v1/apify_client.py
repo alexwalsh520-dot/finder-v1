@@ -107,49 +107,6 @@ class ApifyHTTPClient:
         return json.loads(raw) if raw else {}
 
 
-class AnthropicHTTPClient:
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-
-    def enabled(self) -> bool:
-        return bool(self.api_key)
-
-    def classify(self, model: str, prompt: str, max_tokens: int = 220) -> str:
-        if not self.api_key:
-            raise RuntimeError("ANTHROPIC_API_KEY is not configured")
-        body = {
-            "model": model,
-            "max_tokens": max_tokens,
-            "messages": [{"role": "user", "content": prompt}],
-        }
-        req = urllib.request.Request(
-            "https://api.anthropic.com/v1/messages",
-            data=json.dumps(body).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "anthropic-version": "2023-06-01",
-                "x-api-key": self.api_key,
-            },
-            method="POST",
-        )
-        last_error: Exception | None = None
-        for attempt in range(3):
-            try:
-                with urllib.request.urlopen(req, timeout=90) as response:
-                    data = json.loads(response.read().decode("utf-8"))
-                break
-            except Exception as exc:
-                last_error = exc
-                if attempt == 2 or not _should_retry(exc):
-                    raise
-                time.sleep(1.5 * (attempt + 1))
-        else:
-            assert last_error is not None
-            raise last_error
-        parts = data.get("content", [])
-        return "".join(part.get("text", "") for part in parts)
-
-
 class GroqHTTPClient:
     def __init__(self, api_key: str):
         self.api_key = api_key

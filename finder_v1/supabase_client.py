@@ -11,6 +11,13 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 
+QUALIFIED_SEED_REVIEW_STATUSES = ("approved", "va_approved", "exported_pending_confirmation")
+
+
+def _normalize_handle(value: str | None) -> str:
+    return (value or "").strip().lower().lstrip("@")
+
+
 class SupabaseClient:
     def __init__(self, url: str, service_role_key: str):
         self.url = url.rstrip("/")
@@ -89,7 +96,144 @@ class SupabaseClient:
                 break
             except Exception:
                 rows = []
-        return {row["instagram_handle"]: row for row in rows}
+        return {
+            _normalize_handle(row.get("instagram_handle")): row
+            for row in rows
+            if _normalize_handle(row.get("instagram_handle"))
+        }
+
+    def fetch_existing_leads_by_email(self, email: str) -> List[Dict]:
+        normalized = (email or "").strip().lower()
+        if not normalized:
+            return []
+        _, rows = self._request(
+            "GET",
+            "/leads?"
+            "select=id,instagram_handle,email,status,review_status,sent_to_smartlead,smartlead_campaign_id,smartlead_sent_at"
+            f"&email=eq.{urllib.parse.quote(normalized)}",
+        )
+        return rows if isinstance(rows, list) else []
+
+    def bulk_update_leads(self, lead_ids: List[str], payload: Dict) -> None:
+        ids = [str(lead_id).strip() for lead_id in lead_ids if str(lead_id).strip()]
+        if not ids:
+            return
+        quoted_ids = ",".join(ids)
+        self._request(
+            "PATCH",
+            f"/leads?id=in.({urllib.parse.quote(quoted_ids, safe=',')})",
+            body=payload,
+            extra_headers={"Prefer": "return=representation"},
+        )
+
+    def count_today_net_new_emails(self, credited_date: str, *, source: str = "finder_v1") -> int:
+        path = (
+            "/leads?select=id"
+            f"&email=not.is.null&batch_date=eq.{urllib.parse.quote(credited_date)}"
+            f"&source=eq.{urllib.parse.quote(source)}"
+            "&status=in.(email_ready,mgmt_email)"
+        )
+        headers, _ = self._request("GET", path, extra_headers={"Prefer": "count=exact", "Range": "0-0"})
+        content_range = headers.get("Content-Range", "")
+        if "/" not in content_range:
+            return 0
+        return int(content_range.split("/")[-1])
+
+    def get_app_setting(self, key: str) -> Dict | None:
+        rows = self.fetch_rows(
+            "app_settings",
+            select="key,value,updated_at",
+            filters=[f"key=eq.{urllib.parse.quote(key)}"],
+            limit=1,
+        )
+        return rows[0] if rows else None
+
+    def upsert_app_setting(self, key: str, value: Dict) -> None:
+        self._request(
+            "POST",
+            "/app_settings?on_conflict=key",
+            body={"key": key, "value": value},
+            extra_headers={"Prefer": "resolution=merge-duplicates,return=representation"},
+        )
+
+    def fetch_expanded_seed_handles(self, *, limit: int = 10000) -> set[str]:
+        rows = self.fetch_rows(
+            "discovery_seed_expansions",
+            select="seed_handle",
+            filters=["order=expanded_at.asc"],
+            limit=limit,
+        )
+        return {
+            _normalize_handle(row.get("seed_handle"))
+            for row in rows
+            if _normalize_handle(row.get("seed_handle"))
+        }
+
+    def fetch_qualified_seed_handles(self, *, limit: int = 5000) -> List[str]:
+        rows_by_handle: Dict[str, Dict] = {}
+        for status in QUALIFIED_SEED_REVIEW_STATUSES:
+            rows = self.fetch_rows(
+                "leads",
+                select="instagram_handle,review_status,reviewed_at,created_at,sent_to_smartlead",
+                filters=[
+                    "instagram_handle=not.is.null",
+                    f"review_status=eq.{status}",
+                    "order=reviewed_at.asc.nullslast,created_at.asc",
+                ],
+                limit=limit,
+            )
+            for row in rows:
+                handle = _normalize_handle(row.get("instagram_handle"))
+                if handle and handle not in rows_by_handle:
+                    rows_by_handle[handle] = row
+
+        sent_rows = self.fetch_rows(
+            "leads",
+            select="instagram_handle,review_status,reviewed_at,created_at,sent_to_smartlead",
+            filters=[
+                "instagram_handle=not.is.null",
+                "sent_to_smartlead=is.true",
+                "order=reviewed_at.asc.nullslast,created_at.asc",
+            ],
+            limit=limit,
+        )
+        for row in sent_rows:
+            handle = _normalize_handle(row.get("instagram_handle"))
+            if handle and handle not in rows_by_handle:
+                rows_by_handle[handle] = row
+
+        return list(rows_by_handle.keys())
+
+    def fetch_unexpanded_qualified_seed_handles(self, *, limit: int = 5000) -> List[str]:
+        expanded = self.fetch_expanded_seed_handles(limit=max(limit, 10000))
+        seeds = self.fetch_qualified_seed_handles(limit=limit)
+        return [seed for seed in seeds if seed not in expanded]
+
+    def record_seed_expansion(
+        self,
+        seed_handle: str,
+        *,
+        related_found: int,
+        profiles_checked: int,
+        leads_saved: int,
+        doc_jobs_submitted: int,
+    ) -> None:
+        normalized = _normalize_handle(seed_handle)
+        if not normalized:
+            return
+        self._request(
+            "POST",
+            "/discovery_seed_expansions?on_conflict=seed_handle",
+            body={
+                "seed_handle": normalized,
+                "expanded_at": datetime.utcnow().isoformat() + "Z",
+                "related_found": int(related_found or 0),
+                "profiles_checked": int(profiles_checked or 0),
+                "leads_saved": int(leads_saved or 0),
+                "doc_jobs_submitted": int(doc_jobs_submitted or 0),
+            },
+            extra_headers={"Prefer": "resolution=merge-duplicates,return=representation"},
+        )
 
     def fetch_reviewable_leads(
         self,
@@ -155,6 +299,7 @@ class SupabaseClient:
         basic_path = "/leads?select=instagram_handle&limit=1"
         smartlead_path = "/leads?select=instagram_handle,sent_to_smartlead,smartlead_campaign_id,smartlead_sent_at&limit=1"
         review_path = "/leads?select=instagram_handle,review_status,exported_at,export_batch_id&limit=1"
+        seed_expansion_path = "/discovery_seed_expansions?select=seed_handle&limit=1"
         try:
             self._request("GET", basic_path)
         except Exception as basic_error:
@@ -181,11 +326,19 @@ class SupabaseClient:
             review_ok = False
             errors.append(f"review_fields: {exc}")
 
+        seed_expansion_ok = True
+        try:
+            self._request("GET", seed_expansion_path)
+        except Exception as exc:
+            seed_expansion_ok = False
+            errors.append(f"seed_expansions: {exc}")
+
         return {
             "enabled": True,
             "reachable": True,
             "smartlead_tracking_fields": smartlead_ok,
             "review_app_fields": review_ok,
+            "seed_expansion_table": seed_expansion_ok,
             "error": "; ".join(errors),
         }
 

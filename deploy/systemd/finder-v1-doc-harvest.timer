@@ -2,10 +2,9 @@
 Description=Run Finder V1 DOC harvest every 30 minutes
 
 [Timer]
-OnCalendar=*:0/30
+OnCalendar=*-*-* *:05,35:00
 Persistent=true
 Unit=finder-v1-doc-harvest.service
 
 [Install]
 WantedBy=timers.target
-
