@@ -49,6 +49,7 @@ RUNTIME_STATUS_APP_SETTING_KEY = "finder_v1_runtime_status"
 TOP_UP_MINIMUM_EMAIL_BATCH = 25
 TOP_UP_DEFAULT_MAX_CYCLES = 25
 TOP_UP_DEFAULT_HARD_STOP_HOUR = 22
+WORKER_EVENT_SAMPLE_LIMIT = 5
 
 
 def counts_as_net_new_email(row: Dict[str, Any]) -> bool:
@@ -979,6 +980,32 @@ def reconcile_smartlead(
         "matched": matched_rows,
         "unmatched": unmatched_rows,
     }
+
+
+def compact_smartlead_reconcile_event_data(
+    result: Dict[str, Any],
+    *,
+    limit: int,
+    historical: bool,
+) -> Dict[str, Any]:
+    matched_rows = result.get("matched") or []
+    unmatched_rows = result.get("unmatched") or []
+    payload: Dict[str, Any] = {
+        "day": today_business_date(),
+        "historical": historical,
+        "limit": limit,
+        "rate_limited": bool(result.get("rate_limited")),
+        "summary": dict(result.get("summary") or {}),
+        "matched_count": len(matched_rows),
+        "unmatched_count": len(unmatched_rows),
+    }
+    if matched_rows:
+        payload["matched_sample"] = matched_rows[:WORKER_EVENT_SAMPLE_LIMIT]
+    if unmatched_rows:
+        payload["unmatched_sample"] = unmatched_rows[:WORKER_EVENT_SAMPLE_LIMIT]
+    if result.get("invalid_email_scrub"):
+        payload["invalid_email_scrub"] = result["invalid_email_scrub"]
+    return payload
 
 
 def refresh_saved_results(db: FinderDB, supabase: SupabaseClient | None = None) -> Counter:
@@ -2188,12 +2215,7 @@ def run_smartlead_reconcile_command(limit: int, historical: bool) -> None:
                 )
             ),
             "warning" if outcome == "partial" else ("ok" if outcome == "success" else "error"),
-            {
-                "day": today_business_date(),
-                "historical": historical,
-                "limit": limit,
-                **result,
-            },
+            compact_smartlead_reconcile_event_data(result, limit=limit, historical=historical),
         )
     top_up_result = None
     if not historical:

@@ -15,6 +15,7 @@ from finder_v1.qualification import deterministic_qualification
 from finder_v1.main import (
     build_seed_history,
     classify_reviewable_email,
+    compact_smartlead_reconcile_event_data,
     counts_as_net_new_email,
     filter_duplicate_email_candidates,
     filter_existing_live_handles_before_enrich,
@@ -320,6 +321,30 @@ class ReliabilityTests(unittest.TestCase):
         self.assertEqual([item["email"] for item in usable], ["fresh@example.com"])
         self.assertEqual(counts["duplicate_existing_smartlead"], 1)
         self.assertEqual(counts["duplicate_existing_live_email"], 1)
+
+    def test_smartlead_event_payload_is_compact(self) -> None:
+        result = {
+            "historical": False,
+            "rate_limited": False,
+            "summary": {"checked": 10, "confirmed_sent": 6},
+            "matched": [
+                {"id": index, "email": f"matched{index}@example.com", "instagram_handle": f"matched{index}"}
+                for index in range(10)
+            ],
+            "unmatched": [
+                {"id": index, "email": f"unmatched{index}@example.com", "instagram_handle": f"unmatched{index}"}
+                for index in range(10)
+            ],
+        }
+
+        payload = compact_smartlead_reconcile_event_data(result, limit=5000, historical=False)
+
+        self.assertEqual(payload["matched_count"], 10)
+        self.assertEqual(payload["unmatched_count"], 10)
+        self.assertEqual(len(payload["matched_sample"]), 5)
+        self.assertEqual(len(payload["unmatched_sample"]), 5)
+        self.assertNotIn("matched", payload)
+        self.assertNotIn("unmatched", payload)
 
     def test_filter_duplicate_email_candidates_skips_duplicates_seen_in_same_run(self) -> None:
         class FakeSupabase:
