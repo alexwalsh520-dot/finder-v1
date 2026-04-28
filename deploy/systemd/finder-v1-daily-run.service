@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=oneshot
 User=finder
 WorkingDirectory=/opt/finder-v1
+Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONPYCACHEPREFIX=/opt/finder-v1/.pycache
 EnvironmentFile=/etc/finder-v1.env
 ExecStart=/opt/finder-v1/.venv/bin/python -m finder_v1.main daily-run --target-emails 150 --seed-batch-size 12 --max-cycles 25 --hard-stop-hour-local 22
