@@ -603,7 +603,13 @@ def submit_doc_job(
     }, candidates, True
 
 
-def sync_youtube_state_to_supabase(supabase: SupabaseClient, profile: Dict[str, Any], source_seed: str) -> None:
+def sync_youtube_state_to_supabase(
+    supabase: SupabaseClient,
+    profile: Dict[str, Any],
+    source_seed: str,
+    *,
+    batch_date: str | None = None,
+) -> None:
     if not supabase.enabled() or not profile.get("youtube_url"):
         return
     payload = {
@@ -612,7 +618,7 @@ def sync_youtube_state_to_supabase(supabase: SupabaseClient, profile: Dict[str, 
         "instagram_url": f"https://instagram.com/{profile['username']}",
         "follower_count": int(profile.get("followers") or 0),
         "status": "youtube_only",
-        "batch_date": today_business_date(),
+        "batch_date": batch_date or today_business_date(),
         "source": "finder_v1",
         "source_detail": profile.get("source_detail") or source_seed,
         "bio": profile.get("biography"),
@@ -806,6 +812,8 @@ def sync_best_to_supabase(
     profile: Dict[str, Any],
     best: Dict[str, str],
     source_seed: str,
+    *,
+    batch_date: str | None = None,
 ) -> None:
     payload = {
         "instagram_handle": handle,
@@ -815,7 +823,7 @@ def sync_best_to_supabase(
         "email": best["email"],
         "email_source": best["source_method"],
         "status": "mgmt_email" if best["email_type"] == "management" else "email_ready",
-        "batch_date": today_business_date(),
+        "batch_date": batch_date or today_business_date(),
         "source": "finder_v1",
         "source_detail": profile.get("source_detail") or source_seed,
         "bio": profile.get("biography"),
@@ -839,6 +847,8 @@ def clear_creator_email_in_supabase(
     handle: str,
     profile: Dict[str, Any],
     source_seed: str,
+    *,
+    batch_date: str | None = None,
 ) -> None:
     payload = {
         "instagram_handle": handle,
@@ -848,7 +858,7 @@ def clear_creator_email_in_supabase(
         "email": None,
         "email_source": None,
         "status": "youtube_only" if profile.get("youtube_url") else "no_email",
-        "batch_date": today_business_date(),
+        "batch_date": batch_date or today_business_date(),
         "source": "finder_v1",
         "source_detail": profile.get("source_detail") or source_seed,
         "bio": profile.get("biography"),
@@ -1280,6 +1290,8 @@ def harvest_doc_job(
     supabase: SupabaseClient,
     duplicate_guard: Dict[str, Any] | None,
     job: Dict[str, Any],
+    *,
+    batch_date: str | None = None,
 ) -> bool:
     handle = job["creator_handle"]
     creator = db.get_creator(handle)
@@ -1359,6 +1371,7 @@ def harvest_doc_job(
                 profile,
                 best,
                 creator["source_seed"] if creator and creator["source_seed"] else "doc_harvest",
+                batch_date=batch_date,
             )
         db.mark_doc_job_completed(job["apify_run_id"], "DOC returned a kept email.")
         print(f"  DOC harvested {best['email']} for @{handle}")
@@ -1405,6 +1418,7 @@ def check_doc_jobs(
     duplicate_guard: Dict[str, Any] | None,
     limit: int = DEFAULT_DOC_CHECK_LIMIT,
     time_budget_seconds: int = DEFAULT_DOC_CHECK_TIME_BUDGET_SECONDS,
+    batch_date: str | None = None,
 ) -> int:
     harvested = 0
     counts["doc_pending_before_check"] = db.count_pending_doc_jobs()
@@ -1420,7 +1434,7 @@ def check_doc_jobs(
             print("  Stopping DOC polling for now to keep the daily run moving.")
             break
         try:
-            if harvest_doc_job(db, counts, apify, supabase, duplicate_guard, dict(job)):
+            if harvest_doc_job(db, counts, apify, supabase, duplicate_guard, dict(job), batch_date=batch_date):
                 harvested += 1
         except Exception as exc:
             counts["doc_job_errors"] += 1
@@ -2256,6 +2270,7 @@ def run_seed_cycle(
     seed: str,
     target_emails: int,
     started_at: str,
+    batch_date: str | None = None,
 ) -> Dict[str, int]:
     cycle = Counter()
     if counts["existing_today"] + counts["emails_kept"] >= target_emails:
@@ -2308,7 +2323,7 @@ def run_seed_cycle(
         handle = profile["username"]
         cycle["profiles_checked"] += 1
         try:
-            process_profile(db, counts, profile, apify, youtube_key, supabase, duplicate_guard, seed)
+            process_profile(db, counts, profile, apify, youtube_key, supabase, duplicate_guard, seed, batch_date=batch_date)
             checkpoint_outputs_with_review(db, run_id, counts, started_at)
             if counts["existing_today"] + counts["emails_kept"] >= target_emails:
                 break
@@ -2326,6 +2341,7 @@ def run_seed_cycle(
         duplicate_guard,
         limit=DEFAULT_DOC_CHECK_LIMIT,
         time_budget_seconds=DEFAULT_DOC_CHECK_TIME_BUDGET_SECONDS,
+        batch_date=batch_date,
     )
     if harvested_after:
         cycle["doc_emails_harvested"] += harvested_after
@@ -2353,6 +2369,8 @@ def process_profile(
     supabase: SupabaseClient,
     duplicate_guard: Dict[str, Any] | None,
     source_seed: str,
+    *,
+    batch_date: str | None = None,
 ) -> bool:
     handle = profile["username"]
     followers = int(profile.get("followers") or 0)
@@ -2409,7 +2427,7 @@ def process_profile(
                 db.set_profile(handle, profile, followers)
                 if supabase.enabled():
                     try:
-                        sync_youtube_state_to_supabase(supabase, profile, source_seed)
+                        sync_youtube_state_to_supabase(supabase, profile, source_seed, batch_date=batch_date)
                     except Exception as exc:
                         counts["supabase_sync_errors"] += 1
                         print(f"  Supabase YouTube sync failed for @{handle}: {exc}")
@@ -2429,7 +2447,7 @@ def process_profile(
                 counts["doc_jobs_submitted" if is_new_job else "doc_jobs_reused"] += 1
                 if supabase.enabled():
                     try:
-                        sync_youtube_state_to_supabase(supabase, profile, source_seed)
+                        sync_youtube_state_to_supabase(supabase, profile, source_seed, batch_date=batch_date)
                     except Exception as exc:
                         counts["supabase_sync_errors"] += 1
                         print(f"  Supabase YouTube sync failed for @{handle}: {exc}")
@@ -2456,7 +2474,7 @@ def process_profile(
         counts["emails_kept"] += 1
         print(f"  Kept {best['email']} for @{handle} ({best['email_type']})")
         if supabase.enabled():
-            sync_best_to_supabase(supabase, counts, handle, followers, profile, best, source_seed)
+            sync_best_to_supabase(supabase, counts, handle, followers, profile, best, source_seed, batch_date=batch_date)
         return True
 
     db.record_contact_result(handle, None, None, None, "No kept email found.")
@@ -2476,11 +2494,12 @@ def run_pipeline(seeds: List[str], target_emails: int) -> None:
     db.init()
     run_id = db.create_run(seeds, target_emails)
     started_at = db.conn.execute("select started_at from runs where id = ?", (run_id,)).fetchone()["started_at"]
+    run_day = today_business_date()
 
     counts = Counter()
     paths = {"final": "", "audit": "", "review": "", "new_results": ""}
     if supabase.enabled():
-        todays_existing = supabase.count_today_net_new_emails(today_business_date())
+        todays_existing = supabase.count_today_net_new_emails(run_day)
         counts["existing_today"] = todays_existing
         print(f"Existing centralized emails for today: {todays_existing}")
     print(f"Run {run_id}: targeting {target_emails} usable emails")
@@ -2494,6 +2513,7 @@ def run_pipeline(seeds: List[str], target_emails: int) -> None:
                 duplicate_guard,
                 limit=DEFAULT_DOC_PREFLIGHT_LIMIT,
                 time_budget_seconds=DEFAULT_DOC_PREFLIGHT_TIME_BUDGET_SECONDS,
+                batch_date=run_day,
             )
             if harvested:
                 print(f"Harvested {harvested} email(s) from pending DOC jobs before starting new work.")
@@ -2521,7 +2541,7 @@ def run_pipeline(seeds: List[str], target_emails: int) -> None:
                     continue
                 seen_inventory.add(handle)
                 try:
-                    process_profile(db, counts, profile, apify, youtube_key, supabase, duplicate_guard, "supabase_inventory")
+                    process_profile(db, counts, profile, apify, youtube_key, supabase, duplicate_guard, "supabase_inventory", batch_date=run_day)
                     checkpoint_outputs_with_review(db, run_id, counts, started_at)
                 except Exception as exc:
                     counts["profile_errors"] += 1
@@ -2575,7 +2595,7 @@ def run_pipeline(seeds: List[str], target_emails: int) -> None:
             for profile in queue:
                 handle = profile["username"]
                 try:
-                    process_profile(db, counts, profile, apify, youtube_key, supabase, duplicate_guard, seed)
+                    process_profile(db, counts, profile, apify, youtube_key, supabase, duplicate_guard, seed, batch_date=run_day)
                     checkpoint_outputs_with_review(db, run_id, counts, started_at)
 
                     if counts["existing_today"] + counts["emails_kept"] >= target_emails:
@@ -2598,6 +2618,7 @@ def run_pipeline(seeds: List[str], target_emails: int) -> None:
                 duplicate_guard,
                 limit=DEFAULT_DOC_PREFLIGHT_LIMIT,
                 time_budget_seconds=DEFAULT_DOC_PREFLIGHT_TIME_BUDGET_SECONDS,
+                batch_date=run_day,
             )
         paths = checkpoint_outputs_with_review(db, run_id, counts, started_at)
         summary = dict(counts)
@@ -2724,6 +2745,7 @@ def run_daily(target_emails: int, seed_batch_size: int, max_cycles: int, hard_st
                 duplicate_guard,
                 limit=DEFAULT_DOC_CHECK_LIMIT,
                 time_budget_seconds=DEFAULT_DOC_CHECK_TIME_BUDGET_SECONDS,
+                batch_date=day,
             )
             if harvested:
                 current_count = (supabase.count_today_net_new_emails(day) if supabase.enabled() else db.count_kept_emails_since(started_at))
@@ -2766,6 +2788,7 @@ def run_daily(target_emails: int, seed_batch_size: int, max_cycles: int, hard_st
                     seed,
                     target_emails,
                     started_at,
+                    batch_date=day,
                 )
                 if supabase.enabled():
                     supabase.record_seed_expansion(

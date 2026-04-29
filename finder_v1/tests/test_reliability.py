@@ -26,6 +26,7 @@ from finder_v1.main import (
     remember_session_email,
     scrub_invalid_reviewable_emails,
     select_seed_batch,
+    sync_best_to_supabase,
     sync_runtime_heartbeat,
     validate_target_emails,
     write_daily_review_csv,
@@ -90,6 +91,35 @@ class ReliabilityTests(unittest.TestCase):
                 now=datetime(2026, 4, 29, 1, 0, tzinfo=bali),
             )
         )
+
+    def test_supabase_sync_can_pin_batch_date_to_run_day(self) -> None:
+        class FakeSupabase:
+            def __init__(self) -> None:
+                self.payloads = []
+
+            def upsert_lead(self, payload):
+                self.payloads.append(payload)
+
+        fake_supabase = FakeSupabase()
+        counts = Counter()
+
+        sync_best_to_supabase(
+            fake_supabase,
+            counts,
+            "creator",
+            250000,
+            {"full_name": "Creator Person", "biography": "Training daily"},
+            {
+                "email": "creator@example.com",
+                "email_type": "personal",
+                "source_method": "doc",
+            },
+            "seed",
+            batch_date="2026-04-28",
+        )
+
+        self.assertEqual(fake_supabase.payloads[0]["batch_date"], "2026-04-28")
+        self.assertEqual(counts["synced_to_supabase"], 1)
 
     def test_simple_qualification_uses_only_hard_gates_after_seed_relation(self) -> None:
         qualified = deterministic_qualification(
@@ -565,7 +595,7 @@ class ReliabilityTests(unittest.TestCase):
         fake_supabase = FakeSupabase()
         processed_seeds: list[str] = []
 
-        def fake_run_seed_cycle(db, counts, apify, youtube_key, supabase, duplicate_guard, run_id, seed, target_emails, started_at):
+        def fake_run_seed_cycle(db, counts, apify, youtube_key, supabase, duplicate_guard, run_id, seed, target_emails, started_at, batch_date=None):
             processed_seeds.append(seed)
             fake_supabase.current = target_emails
             counts["kept"] += target_emails
