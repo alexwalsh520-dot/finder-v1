@@ -19,7 +19,7 @@ from .reel_transcriber import download_media, profile_reel_posts, transcript_out
 from .runtime_lock import PipelineBusyError, pipeline_lock, read_lock_metadata
 from .smartlead import build_account_lead_index, extract_campaign_id, normalize_instagram_handle
 from .supabase_client import SupabaseClient
-from .time_utils import business_now, next_business_time_iso, next_interval_iso, today_business_date, utc_now_iso
+from .time_utils import business_now, business_tz, next_business_time_iso, next_interval_iso, today_business_date, utc_now_iso
 from .youtube_search import search_channel
 
 DEFAULT_DAILY_EMAIL_TARGET = 150
@@ -311,6 +311,23 @@ def validate_target_emails(target_emails: int, *, command_name: str) -> int:
             f"{command_name} requires --target-emails > 0. Refusing to run a fake-success batch with target {target_emails}."
         )
     return target_emails
+
+
+def daily_hard_stop_reached(day: str, hard_stop_hour_local: int, *, now: datetime | None = None) -> bool:
+    timezone = business_tz()
+    stop_at = datetime.strptime(day, "%Y-%m-%d").replace(
+        hour=hard_stop_hour_local,
+        minute=0,
+        second=0,
+        microsecond=0,
+        tzinfo=timezone,
+    )
+    current = now or business_now()
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone)
+    else:
+        current = current.astimezone(timezone)
+    return current >= stop_at
 
 
 def parse_args() -> argparse.Namespace:
@@ -2716,8 +2733,8 @@ def run_daily(target_emails: int, seed_batch_size: int, max_cycles: int, hard_st
             current_count = supabase.count_today_net_new_emails(day) if supabase.enabled() else db.count_kept_emails_since(started_at)
             if current_count >= target_emails:
                 break
-            now_local = business_now()
-            if now_local.hour >= hard_stop_hour_local:
+            if daily_hard_stop_reached(day, hard_stop_hour_local):
+                counts["hard_stop_reached"] += 1
                 print(f"Stopping daily run because hard stop hour local {hard_stop_hour_local} was reached.")
                 break
 
@@ -2733,6 +2750,10 @@ def run_daily(target_emails: int, seed_batch_size: int, max_cycles: int, hard_st
             cycle_start_count = current_count
             cycle_doc_harvest = 0
             for seed in seed_batch:
+                if daily_hard_stop_reached(day, hard_stop_hour_local):
+                    counts["hard_stop_reached"] += 1
+                    print(f"Stopping daily run before @{seed} because hard stop hour local {hard_stop_hour_local} was reached.")
+                    break
                 before_cycle = Counter(counts)
                 stats = run_seed_cycle(
                     db,
@@ -2891,6 +2912,8 @@ def run_daily(target_emails: int, seed_batch_size: int, max_cycles: int, hard_st
                 break
             if low_yield_cycles >= LOW_YIELD_STALL_THRESHOLD:
                 print("Stopping daily run after repeated low-yield cycles.")
+                break
+            if counts["hard_stop_reached"]:
                 break
     except Exception as exc:
         fatal_error = exc

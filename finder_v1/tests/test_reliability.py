@@ -8,6 +8,7 @@ from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 from finder_v1.db import FinderDB
 from finder_v1.email_search import classify_email, deep_email_search
@@ -19,6 +20,7 @@ from finder_v1.main import (
     counts_as_net_new_email,
     filter_duplicate_email_candidates,
     filter_existing_live_handles_before_enrich,
+    daily_hard_stop_reached,
     live_row_blocks_processing,
     run_daily,
     remember_session_email,
@@ -63,6 +65,31 @@ class ReliabilityTests(unittest.TestCase):
                 return False
 
         self.assertEqual(select_seed_batch(FakeSupabase(), batch_size=2), [])
+
+    def test_daily_hard_stop_stays_reached_after_midnight(self) -> None:
+        bali = ZoneInfo("Asia/Makassar")
+
+        self.assertFalse(
+            daily_hard_stop_reached(
+                "2026-04-28",
+                22,
+                now=datetime(2026, 4, 28, 21, 59, tzinfo=bali),
+            )
+        )
+        self.assertTrue(
+            daily_hard_stop_reached(
+                "2026-04-28",
+                22,
+                now=datetime(2026, 4, 28, 22, 0, tzinfo=bali),
+            )
+        )
+        self.assertTrue(
+            daily_hard_stop_reached(
+                "2026-04-28",
+                22,
+                now=datetime(2026, 4, 29, 1, 0, tzinfo=bali),
+            )
+        )
 
     def test_simple_qualification_uses_only_hard_gates_after_seed_relation(self) -> None:
         qualified = deterministic_qualification(
