@@ -22,10 +22,13 @@ from .supabase_client import SupabaseClient
 from .time_utils import business_now, next_business_time_iso, next_interval_iso, today_business_date, utc_now_iso
 from .youtube_search import search_channel
 
-DEFAULT_DAILY_TARGET = 100
+DEFAULT_DAILY_TARGET = 150
 DEFAULT_DAILY_BATCH_SIZE = 12
-DEFAULT_DOC_CHECK_LIMIT = 100
+DEFAULT_DOC_CHECK_LIMIT = 300
 DEFAULT_SMARTLEAD_RECONCILE_LIMIT = 5000
+DOC_FORBIDDEN_FAILURE_THRESHOLD = 3
+DOC_LOOKUP_ERROR_FAILURE_THRESHOLD = 3
+TERMINAL_APIFY_STATUSES = {"SUCCEEDED", "FAILED", "TIMED-OUT", "ABORTED"}
 ZERO_PROGRESS_ROTATION_THRESHOLD = 2
 STALL_PROGRESS_MINUTES = 90
 DEFAULT_FALLBACK_SEEDS = [
@@ -43,7 +46,7 @@ CRON_JOB_DAILY_ID = "finder-v1-daily-run"
 CRON_JOB_DOC_ID = "finder-v1-doc-harvest"
 CRON_JOB_SMARTLEAD_ID = "finder-v1-smartlead-reconcile"
 DAILY_RUN_SCHEDULE = "Daily 02:00 Bali time"
-DOC_HARVEST_SCHEDULE = "Every 30 minutes"
+DOC_HARVEST_SCHEDULE = "Every 10 minutes"
 SMARTLEAD_RECONCILE_SCHEDULE = "Every 2 minutes"
 
 
@@ -62,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     daily_parser.add_argument("--hard-stop-hour-local", type=int, default=22)
 
     check_doc_parser = subparsers.add_parser("check-doc", help="Poll pending DataOverCoffee jobs and harvest finished emails")
-    check_doc_parser.add_argument("--limit", type=int, default=100, help="Maximum pending DOC jobs to check")
+    check_doc_parser.add_argument("--limit", type=int, default=DEFAULT_DOC_CHECK_LIMIT, help="Maximum pending DOC jobs to check")
 
     reconcile_parser = subparsers.add_parser("reconcile-smartlead", help="Check Smartlead and mark sent leads back into Supabase")
     reconcile_parser.add_argument("--limit", type=int, default=DEFAULT_SMARTLEAD_RECONCILE_LIMIT, help="Maximum leads to check")
@@ -229,6 +232,8 @@ def parse_iso_utc(value: str | None) -> datetime | None:
 
 
 def should_resurrect_doc(job: Dict[str, Any], apify_status: str, doc_payload: Dict[str, Any]) -> bool:
+    if doc_payload.get("_http_status") == 403:
+        return False
     if apify_status.upper() not in {"SUCCEEDED", "FAILED", "TIMED-OUT", "ABORTED"}:
         return False
     if doc_is_done(doc_payload):
@@ -812,7 +817,7 @@ def import_dashboard_database() -> Dict[str, Any]:
 
 def transcribe_reels_for_handle(handle: str, limit: int) -> Dict[str, Any]:
     cfg = api_config()
-    apify = ApifyHTTPClient(cfg["apify_token"])
+    apify = ApifyHTTPClient(cfg["apify_token"], cfg["dataovercoffee_api_key"])
     groq = GroqHTTPClient(cfg["groq_key"])
     if not apify.enabled():
         raise RuntimeError("APIFY_API_TOKEN is not configured")
@@ -916,8 +921,12 @@ def harvest_doc_job(
     try:
         run = apify.get_run(job["apify_run_id"])
     except Exception as exc:
-        db.update_doc_job_status(job["apify_run_id"], error=f"Apify run check failed: {exc}")
+        count = db.increment_doc_job_counter(job["apify_run_id"], "lookup_error_count", f"Apify run check failed: {exc}")
         counts["doc_status_errors"] += 1
+        counts["doc_apify_run_lookup_errors"] += 1
+        if count >= DOC_LOOKUP_ERROR_FAILURE_THRESHOLD:
+            db.mark_doc_job_completed(job["apify_run_id"], f"Retired after {count} Apify run lookup error(s).")
+            counts["doc_failed_lookup_limit"] += 1
         return False
 
     try:
@@ -928,19 +937,37 @@ def harvest_doc_job(
         counts["doc_status_errors"] += 1
     else:
         if doc_payload.get("_http_status") == 403:
+            counts["doc_status_forbidden"] += 1
             counts["doc_status_unavailable"] += 1
 
     dataset_id = run.get("defaultDatasetId") or job.get("dataset_id") or ""
     items = apify.get_dataset_items(dataset_id) if dataset_id else []
     candidates = parse_doc_candidates(items, job["youtube_channel"])
+    apify_status = (run.get("status") or job.get("apify_status") or "UNKNOWN").upper()
     db.update_doc_job_status(
         job["apify_run_id"],
-        apify_status=run.get("status") or job.get("apify_status") or "UNKNOWN",
+        apify_status=apify_status,
         doc_status=doc_status_text(doc_payload),
         dataset_id=dataset_id,
         results_collected=len(candidates),
         notes=json.dumps(doc_payload)[:400] if doc_payload else "No DOC status payload.",
     )
+
+    if not candidates and doc_payload.get("_http_status") == 403:
+        count = db.increment_doc_job_counter(
+            job["apify_run_id"],
+            "forbidden_count",
+            "DOC status endpoint returned 403 and the dataset had no email candidates.",
+        )
+        if apify_status in TERMINAL_APIFY_STATUSES or count >= DOC_FORBIDDEN_FAILURE_THRESHOLD:
+            db.mark_doc_job_completed(
+                job["apify_run_id"],
+                f"Retired DOC job after 403/no-result response ({count} blocked check(s)).",
+            )
+            counts["doc_failed_forbidden"] += 1
+        else:
+            counts["doc_pending"] += 1
+        return False
 
     new_candidates = []
     for candidate in candidates:
@@ -979,7 +1006,6 @@ def harvest_doc_job(
         print(f"  DOC harvested {best['email']} for @{handle}")
         return True
 
-    apify_status = (run.get("status") or "").upper()
     if should_resurrect_doc(job, apify_status, doc_payload):
         resurrected = apify.resurrect_run(job["apify_run_id"], wait_secs=30)
         new_run_id = resurrected.get("id") or job["apify_run_id"]
@@ -1421,6 +1447,7 @@ def run_doctor() -> None:
     storage = supabase.probe_storage_bucket(cfg["finder_output_bucket"])
     env = {
         "apify_token": bool(cfg["apify_token"]),
+        "dataovercoffee_key": bool(cfg["dataovercoffee_api_key"]),
         "anthropic_key": bool(cfg["anthropic_key"]),
         "youtube_key": bool(cfg["youtube_key"]),
         "smartlead_key": bool(cfg["smartlead_api_key"]),
@@ -1444,6 +1471,8 @@ def run_doctor() -> None:
     action_items: List[str] = []
     if not env["apify_token"]:
         action_items.append("Add APIFY_API_TOKEN before cloud deployment.")
+    if not env["dataovercoffee_key"]:
+        action_items.append("Add DATAOVERCOFFEE_API_KEY if DOC status checks return 403 forbidden.")
     if not env["youtube_key"]:
         action_items.append("Add YOUTUBE_API_KEY before cloud deployment.")
     if not env["supabase"]:
@@ -1804,7 +1833,7 @@ def process_profile(
 def run_pipeline(seeds: List[str], target_emails: int) -> None:
     ensure_dirs()
     cfg = api_config()
-    apify = ApifyHTTPClient(cfg["apify_token"])
+    apify = ApifyHTTPClient(cfg["apify_token"], cfg["dataovercoffee_api_key"])
     anthropic = AnthropicHTTPClient(cfg["anthropic_key"])
     youtube_key = cfg["youtube_key"]
     supabase = SupabaseClient(cfg["supabase_url"], cfg["supabase_service_role_key"])
@@ -1932,7 +1961,7 @@ def utc_now_fallback() -> str:
 def run_daily(target_emails: int, seed_batch_size: int, max_cycles: int, hard_stop_hour_local: int) -> None:
     ensure_dirs()
     cfg = api_config()
-    apify = ApifyHTTPClient(cfg["apify_token"])
+    apify = ApifyHTTPClient(cfg["apify_token"], cfg["dataovercoffee_api_key"])
     anthropic = AnthropicHTTPClient(cfg["anthropic_key"])
     youtube_key = cfg["youtube_key"]
     supabase = SupabaseClient(cfg["supabase_url"], cfg["supabase_service_role_key"])
@@ -2288,7 +2317,7 @@ def main() -> None:
             with pipeline_lock(LOCK_PATH, "check-doc", {"limit": args.limit}):
                 ensure_dirs()
                 cfg = api_config()
-                apify = ApifyHTTPClient(cfg["apify_token"])
+                apify = ApifyHTTPClient(cfg["apify_token"], cfg["dataovercoffee_api_key"])
                 supabase = SupabaseClient(cfg["supabase_url"], cfg["supabase_service_role_key"])
                 db = FinderDB(DB_PATH)
                 db.init()

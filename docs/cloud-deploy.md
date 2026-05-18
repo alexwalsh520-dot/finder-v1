@@ -25,6 +25,7 @@ Create `/etc/finder-v1.env` with:
 
 ```env
 APIFY_API_TOKEN=
+DATAOVERCOFFEE_API_KEY=
 ANTHROPIC_API_KEY=
 YOUTUBE_API_KEY=
 SMARTLEAD_API_KEY=
@@ -58,7 +59,7 @@ FINDER_OUTPUT_BUCKET=finder-outputs
 ## What should happen
 - at boot: stale interrupted local state is repaired
 - at 02:00 Bali time: the daily run starts
-- every 30 minutes: pending DOC jobs are checked
+- every 10 minutes: pending DOC jobs are checked
 - every 10 minutes: pending Smartlead confirmations are reconciled
 - the worker writes plain status to Supabase
 - daily CSV/JSON outputs upload to the `finder-outputs` storage bucket

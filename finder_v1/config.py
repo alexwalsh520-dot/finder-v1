@@ -121,6 +121,7 @@ def api_config() -> Dict[str, str]:
     load_env()
     return {
         "apify_token": os.environ.get("APIFY_API_TOKEN", ""),
+        "dataovercoffee_api_key": os.environ.get("DATAOVERCOFFEE_API_KEY", ""),
         "anthropic_key": os.environ.get("ANTHROPIC_API_KEY", ""),
         "groq_key": os.environ.get("GROQ_API_KEY", ""),
         "youtube_key": os.environ.get("YOUTUBE_API_KEY", ""),

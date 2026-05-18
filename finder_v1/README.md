@@ -24,6 +24,7 @@ Create `finder_v1/.env` with:
 
 ```env
 APIFY_API_TOKEN=
+DATAOVERCOFFEE_API_KEY=
 ANTHROPIC_API_KEY=
 YOUTUBE_API_KEY=
 SMARTLEAD_API_KEY=
@@ -64,7 +65,7 @@ python3 -m finder_v1.main run --seeds cbum,simeonpanda,mikeohearn --target-email
 2. Harvest pending DOC jobs later:
 
 ```bash
-python3 -m finder_v1.main check-doc --limit 50
+python3 -m finder_v1.main check-doc --limit 300
 ```
 
 3. Rebuild the clean export after classification changes or big backlog harvests:
@@ -76,7 +77,7 @@ python3 -m finder_v1.main refresh-results
 4. Run the full daily operator until the target is hit or the day stops:
 
 ```bash
-python3 -m finder_v1.main daily-run --target-emails 100 --hard-stop-hour-local 22
+python3 -m finder_v1.main daily-run --target-emails 150 --hard-stop-hour-local 22
 ```
 
 5. Check machine-readable status for today:
