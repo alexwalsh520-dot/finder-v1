@@ -18,8 +18,9 @@ def _should_retry(exc: Exception) -> bool:
 
 
 class ApifyHTTPClient:
-    def __init__(self, token: str):
+    def __init__(self, token: str, dataovercoffee_api_key: str = ""):
         self.token = token
+        self.dataovercoffee_api_key = dataovercoffee_api_key
 
     def enabled(self) -> bool:
         return bool(self.token)
@@ -85,9 +86,14 @@ class ApifyHTTPClient:
         url = f"https://api.dataovercoffee.com/youtube/run-status?{params}"
         last_error: Exception | None = None
         raw = ""
+        headers = {"User-Agent": "finder-v1/1.0"}
+        if self.dataovercoffee_api_key:
+            headers["Authorization"] = f"Bearer {self.dataovercoffee_api_key}"
+            headers["x-api-key"] = self.dataovercoffee_api_key
         for attempt in range(3):
             try:
-                with urllib.request.urlopen(url, timeout=60) as response:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=60) as response:
                     raw = response.read().decode("utf-8")
                 break
             except urllib.error.HTTPError as exc:

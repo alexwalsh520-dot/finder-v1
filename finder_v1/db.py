@@ -86,6 +86,8 @@ class FinderDB:
               doc_status text,
               results_collected integer not null default 0,
               resurrect_count integer not null default 0,
+              forbidden_count integer not null default 0,
+              lookup_error_count integer not null default 0,
               submitted_at text not null,
               last_checked_at text,
               completed_at text,
@@ -136,7 +138,15 @@ class FinderDB:
             );
             """
         )
+        self._ensure_column("doc_jobs", "forbidden_count", "integer not null default 0")
+        self._ensure_column("doc_jobs", "lookup_error_count", "integer not null default 0")
         self.conn.commit()
+
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        rows = self.conn.execute(f"pragma table_info({table})").fetchall()
+        if any(row["name"] == column for row in rows):
+            return
+        self.conn.execute(f"alter table {table} add column {column} {definition}")
 
     def create_run(self, seeds: List[str], target_emails: int) -> int:
         cur = self.conn.execute(
@@ -420,6 +430,24 @@ class FinderDB:
             ),
         )
         self.conn.commit()
+
+    def increment_doc_job_counter(self, run_id: str, column: str, note: str = "") -> int:
+        if column not in {"forbidden_count", "lookup_error_count"}:
+            raise ValueError(f"Unsupported doc job counter: {column}")
+        existing = self.get_doc_job(run_id)
+        if not existing:
+            return 0
+        next_count = int(existing[column] or 0) + 1
+        self.conn.execute(
+            f"""
+            update doc_jobs
+            set {column} = ?, last_checked_at = ?, status_notes = ?, last_error = ?
+            where apify_run_id = ?
+            """,
+            (next_count, utc_now(), note or existing["status_notes"], note or existing["last_error"], run_id),
+        )
+        self.conn.commit()
+        return next_count
 
     def mark_doc_job_completed(self, run_id: str, note: str = "") -> None:
         self.conn.execute(

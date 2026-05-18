@@ -26,13 +26,13 @@ python3 -m finder_v1.main doctor
 Run the daily worker:
 
 ```bash
-python3 -m finder_v1.main daily-run --target-emails 100 --hard-stop-hour-local 22
+python3 -m finder_v1.main daily-run --target-emails 150 --hard-stop-hour-local 22
 ```
 
 Run the DOC harvest:
 
 ```bash
-python3 -m finder_v1.main check-doc --limit 100
+python3 -m finder_v1.main check-doc --limit 300
 ```
 
 Run the Smartlead reconcile:

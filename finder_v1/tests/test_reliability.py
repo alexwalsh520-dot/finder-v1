@@ -7,7 +7,14 @@ from collections import Counter
 from pathlib import Path
 
 from finder_v1.db import FinderDB
-from finder_v1.main import build_seed_rankings, select_seed_batch, write_daily_seed_report_csv, write_daily_summary_json
+from finder_v1.main import (
+    DOC_LOOKUP_ERROR_FAILURE_THRESHOLD,
+    build_seed_rankings,
+    harvest_doc_job,
+    select_seed_batch,
+    write_daily_seed_report_csv,
+    write_daily_summary_json,
+)
 from finder_v1.runtime_lock import PipelineBusyError, pipeline_lock
 from finder_v1.supabase_client import SupabaseClient
 
@@ -121,6 +128,40 @@ class ReliabilityTests(unittest.TestCase):
         handles = [row["seed_handle"] for row in rankings]
         self.assertIn("cbum", handles)
         self.assertIn("simeonpanda", handles)
+
+    def test_terminal_forbidden_doc_job_is_retired(self) -> None:
+        self.db.upsert_doc_job("alpha", "https://youtube.com/@alpha", "run-1", "dataset-1", "SUCCEEDED", "SUCCEEDED")
+
+        class FakeApify:
+            def get_run(self, run_id: str):
+                return {"id": run_id, "status": "SUCCEEDED", "defaultDatasetId": "dataset-1"}
+
+            def get_doc_run_status(self, run_id: str):
+                return {"status": "forbidden", "_http_status": 403}
+
+            def get_dataset_items(self, dataset_id: str):
+                return []
+
+        counts = Counter()
+        harvested = harvest_doc_job(self.db, counts, FakeApify(), SupabaseClient("", ""), dict(self.db.get_doc_job("run-1")))
+
+        self.assertFalse(harvested)
+        self.assertEqual(self.db.count_pending_doc_jobs(), 0)
+        self.assertEqual(counts["doc_failed_forbidden"], 1)
+
+    def test_repeated_doc_lookup_errors_are_retired(self) -> None:
+        self.db.upsert_doc_job("alpha", "https://youtube.com/@alpha", "run-2", "dataset-2", "RUNNING", "RUNNING")
+
+        class FakeApify:
+            def get_run(self, run_id: str):
+                raise RuntimeError("not found")
+
+        counts = Counter()
+        for _ in range(DOC_LOOKUP_ERROR_FAILURE_THRESHOLD):
+            harvest_doc_job(self.db, counts, FakeApify(), SupabaseClient("", ""), dict(self.db.get_doc_job("run-2")))
+
+        self.assertEqual(self.db.count_pending_doc_jobs(), 0)
+        self.assertEqual(counts["doc_failed_lookup_limit"], 1)
 
 
 if __name__ == "__main__":

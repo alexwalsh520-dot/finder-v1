@@ -9,5 +9,4 @@ User=finder
 WorkingDirectory=/opt/finder-v1
 Environment=PYTHONPYCACHEPREFIX=/opt/finder-v1/.pycache
 EnvironmentFile=/etc/finder-v1.env
-ExecStart=/opt/finder-v1/.venv/bin/python -m finder_v1.main check-doc --limit 100
-
+ExecStart=/opt/finder-v1/.venv/bin/python -m finder_v1.main check-doc --limit 300
